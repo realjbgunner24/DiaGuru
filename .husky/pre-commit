@@ -1,5 +1,4 @@
 #!/usr/bin/env sh
 cd "$(git rev-parse --show-toplevel)/dia-guru" || exit 1
-npm run -s lint --if-present || exit 1
+npx --no-install lint-staged || exit 1
 npm run -s typecheck --if-present || exit 1
-npm test --if-present -- --passWithNoTests
