@@ -1,0 +1,9 @@
+﻿#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+cd dia-guru
+
+# run only if scripts exist; fail if they fail
+npm run -s lint --if-present || exit 1
+npm run -s typecheck --if-present || exit 1
+npm test --if-present -- --passWithNoTests
