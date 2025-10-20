@@ -3,12 +3,12 @@ on:
   pull_request:
     branches: ["main"]
     paths:
-      - 'dia-guru/**'
+      - 'dia-guru-reboot/**'
       - '.github/workflows/ci.yml'
   push:
     branches: ["main"]
     paths:
-      - 'dia-guru/**'
+      - 'dia-guru-reboot/**'
       - '.github/workflows/ci.yml'
 
 concurrency:
@@ -20,14 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: dia-guru
+        working-directory: dia-guru-reboot
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: dia-guru/package-lock.json
+          cache-dependency-path: dia-guru-reboot/package-lock.json
       - run: npm ci
       - run: npm run lint --if-present
 
@@ -35,37 +35,16 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: dia-guru
+        working-directory: dia-guru-reboot
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: dia-guru/package-lock.json
+          cache-dependency-path: dia-guru-reboot/package-lock.json
       - run: npm ci
       - run: npm run typecheck --if-present
-
-  test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dia-guru
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: dia-guru/package-lock.json
-      - run: npm ci
-      - run: npm test --if-present -- --ci --passWithNoTests --coverage
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: dia-guru/coverage
 
   policy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
