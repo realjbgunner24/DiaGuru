@@ -1,8 +1,13 @@
 {
   "devDependencies": {
+    "babel-plugin-module-resolver": "^5.0.2",
     "husky": "^9.1.7"
   },
   "scripts": {
     "prepare": "husky"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "^2.2.0",
+    "@supabase/supabase-js": "^2.76.1"
   }
 }
