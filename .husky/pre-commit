@@ -1,5 +1,20 @@
 #!/usr/bin/env sh
-cd "$(git rev-parse --show-toplevel)/dia-guru" || exit 1
+# Run lint-staged (if present) and typecheck inside the app folder.
+set -e
 
-npx --no-install lint-staged --config .lintstagedrc.json || exit 1
-npm run -s typecheck --if-present || exit 1
+# Top of repo and app dir
+TOP="$(git rev-parse --show-toplevel)"
+APP="$TOP/dia-guru-reboot"
+
+# If the app folder doesn't exist, don't block the commit
+[ -d "$APP" ] || exit 0
+cd "$APP"
+
+# Prefer lint-staged if configured, else just run lint
+if [ -f ".lintstagedrc.json" ] || [ -f "lint-staged.config.js" ]; then
+  npx --yes lint-staged
+else
+  npm run -s lint --if-present
+fi
+
+npm run -s typecheck --if-present
