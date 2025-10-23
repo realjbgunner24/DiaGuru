@@ -1,3 +1,4 @@
+import { fetchProfile, upsertProfile } from '@/lib/profile'
 import { Button, Input } from '@rneui/themed'
 import { Session } from '@supabase/supabase-js'
 import { useEffect, useState } from 'react'
@@ -19,19 +20,12 @@ export default function Account({ session }: { session: Session }) {
       setLoading(true)
       if (!session?.user) throw new Error('No user on the session!')
 
-      const { data, error, status } = await supabase
-        .from('profiles')
-        .select(`username, website, avatar_url`)
-        .eq('id', session?.user.id)
-        .single()
-      if (error && status !== 406) {
-        throw error
-      }
+      const data = await fetchProfile(session.user.id)
 
       if (data) {
-        setUsername(data.username)
-        setWebsite(data.website)
-        setAvatarUrl(data.avatar_url)
+        setUsername(data.username ?? '')
+        setWebsite(data.website ?? '')
+        setAvatarUrl(data.avatar_url ?? '')
       }
     } catch (error) {
       if (error instanceof Error) {
@@ -60,14 +54,10 @@ export default function Account({ session }: { session: Session }) {
         username,
         website,
         avatar_url,
-        updated_at: new Date(),
+        updated_at: new Date().toISOString(),
       }
 
-      const { error } = await supabase.from('profiles').upsert(updates)
-
-      if (error) {
-        throw error
-      }
+      await upsertProfile(updates)
     } catch (error) {
       if (error instanceof Error) {
         Alert.alert(error.message)

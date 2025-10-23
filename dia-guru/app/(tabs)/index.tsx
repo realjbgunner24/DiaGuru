@@ -1,38 +1,13 @@
 // app/(tabs)/index.tsx
-import { Session } from '@supabase/supabase-js';
-import { useEffect, useState } from 'react';
-import { View } from 'react-native';
-
-
-import Account from '@/components/Account';
+import Account from '@/components/Account'; // adjust — you said no /ui
 import Auth from '@/components/Auth';
-import { supabase } from '@/lib/supabase';
-
-
+import { useSupabaseSession } from '@/hooks/useSupabaseSession';
+import { ActivityIndicator, View } from 'react-native';
 
 export default function HomeTab() {
-  const [session, setSession] = useState<Session | null>(null);
+  const { session, ready } = useSupabaseSession();
 
-  useEffect(() => {
-    let mounted = true;
-
-    // initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!mounted) return;
-      setSession(session ?? null);
-    });
-
-    // keep in sync with auth changes
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      if (!mounted) return;
-      setSession(s ?? null);
-    });
-
-    return () => {
-      mounted = false;
-      sub.subscription.unsubscribe();
-    };
-  }, []);
+  if (!ready) return <ActivityIndicator />;
 
   return (
     <View style={{ flex: 1 }}>
