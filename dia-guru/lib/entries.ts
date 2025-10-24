@@ -5,8 +5,8 @@ export type Entry = {
   user_id: string;
   title: string | null;
   body: string | null;
-  created_at: string;  // timestamptz → string
-  updated_at: string;  // timestamptz → string
+  created_at: string;
+  updated_at: string;
 };
 
 export async function listMyEntries() {
@@ -26,4 +26,20 @@ export async function addEntry(userId: string, title: string, body: string) {
     .single();
   if (error) throw error;
   return data as Entry;
+}
+
+export async function updateEntry(id: number, title: string, body: string) {
+  const { data, error } = await supabase
+    .from('entries')
+    .update({ title, body })
+    .eq('id', id)
+    .select('id,title,body,created_at,updated_at')
+    .single();
+  if (error) throw error;
+  return data as Entry;
+}
+
+export async function deleteEntry(id: number) {
+  const { error } = await supabase.from('entries').delete().eq('id', id);
+  if (error) throw error;
 }
