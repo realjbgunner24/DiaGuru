@@ -11,8 +11,13 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => <MaterialIcons name="home" size={size} color={color} />,
         }}
       />
-      {/* Remove Explore if you don't want it */}
-      {/* <Tabs.Screen name="explore" options={{ title: 'Explore', tabBarIcon: ({ color, size }) => <MaterialIcons name="explore" size={size} color={color} /> }} /> */}
+      <Tabs.Screen
+        name="entries"
+        options={{
+          title: 'Entries',
+          tabBarIcon: ({ color, size }) => <MaterialIcons name="list" size={size} color={color} />,
+        }}
+      />
       <Tabs.Screen
         name="profile"
         options={{
