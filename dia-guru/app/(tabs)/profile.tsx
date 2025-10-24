@@ -1,3 +1,4 @@
+// app/(tabs)/profile.tsx
 import { Session } from '@supabase/supabase-js';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator } from 'react-native';
