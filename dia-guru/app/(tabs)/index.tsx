@@ -23,6 +23,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const IMPORTANCE_LEVELS = [
   { value: 1, label: 'Low' },
@@ -53,6 +54,7 @@ function extractScheduleError(error: unknown) {
 export default function HomeTab() {
   const { session } = useSupabaseSession();
   const userId = session?.user?.id ?? null;
+  const insets = useSafeAreaInsets();
 
   const [idea, setIdea] = useState('');
   const [minutesInput, setMinutesInput] = useState('');
@@ -249,6 +251,11 @@ export default function HomeTab() {
     [scheduled],
   );
 
+  const pendingPreview = useMemo(() => pending.slice(0, 3), [pending]);
+  const overduePreview = useMemo(() => overdueScheduled.slice(0, 2), [overdueScheduled]);
+  const upcomingPreview = useMemo(() => upcomingScheduled.slice(0, 3), [upcomingScheduled]);
+  const eventsPreview = useMemo(() => events.slice(0, 5), [events]);
+
   const handleCompletionAction = useCallback(
     async (capture: Capture, action: CaptureStatus | 'reschedule') => {
       if (!userId) return;
@@ -361,9 +368,12 @@ export default function HomeTab() {
               </Text>
             </TouchableOpacity>
           </View>
-          {pending.map((capture) => (
+          {pendingPreview.map((capture) => (
             <CaptureCard key={capture.id} capture={capture} />
           ))}
+          {pending.length > pendingPreview.length ? (
+            <Text style={styles.sectionSubtext}>{`+${pending.length - pendingPreview.length} more waiting in the queue`}</Text>
+          ) : null}
         </View>
       )}
     </View>
@@ -388,7 +398,7 @@ export default function HomeTab() {
           {overdueScheduled.length > 0 && (
             <View style={{ gap: 12 }}>
               <Text style={styles.sectionSubtitle}>Needs check-in</Text>
-              {overdueScheduled.map((capture) => (
+              {overduePreview.map((capture) => (
                 <ScheduledCard
                   key={capture.id}
                   capture={capture}
@@ -397,15 +407,21 @@ export default function HomeTab() {
                   onReschedule={() => handleCompletionAction(capture, 'reschedule')}
                 />
               ))}
+              {overdueScheduled.length > overduePreview.length ? (
+                <Text style={styles.sectionSubtext}>{`+${overdueScheduled.length - overduePreview.length} more awaiting confirmation`}</Text>
+              ) : null}
             </View>
           )}
 
           {upcomingScheduled.length > 0 && (
             <View style={{ gap: 12, marginTop: overdueScheduled.length > 0 ? 16 : 0 }}>
               <Text style={styles.sectionSubtitle}>Upcoming</Text>
-              {upcomingScheduled.map((capture) => (
+              {upcomingPreview.map((capture) => (
                 <ScheduledSummaryCard key={capture.id} capture={capture} />
               ))}
+              {upcomingScheduled.length > upcomingPreview.length ? (
+                <Text style={styles.sectionSubtext}>{`+${upcomingScheduled.length - upcomingPreview.length} later this week`}</Text>
+              ) : null}
             </View>
           )}
         </>
@@ -416,30 +432,41 @@ export default function HomeTab() {
   const eventsContent = useMemo(() => {
     if (eventsLoading) return <ActivityIndicator />;
     if (eventsError) return <Text style={styles.errorText}>{eventsError}</Text>;
-    if (events.length === 0) {
+    if (eventsPreview.length === 0) {
       return <Text style={styles.sectionSubtext}>Nothing scheduled over the next seven days.</Text>;
     }
 
-    return events.map((event) => <EventRow key={event.id} e={event} />);
-  }, [events, eventsError, eventsLoading]);
+    return (
+      <>
+        {eventsPreview.map((event) => (
+          <EventRow key={event.id} e={event} />
+        ))}
+        {events.length > eventsPreview.length ? (
+          <Text style={styles.sectionSubtext}>{`+${events.length - eventsPreview.length} more events synced from Google`}</Text>
+        ) : null}
+      </>
+    );
+  }, [events, eventsError, eventsLoading, eventsPreview]);
 
   return (
-    <ScrollView
-      style={{ flex: 1 }}
-      contentContainerStyle={{ padding: 16, gap: 24 }}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-    >
-      {captureForm}
-      {scheduledSection}
+    <SafeAreaView style={[styles.safeArea, { paddingTop: Math.max(insets.top, 16) }]}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+      >
+        {captureForm}
+        {scheduledSection}
 
-      <View style={styles.captureSection}>
-        <Text style={styles.sectionTitle}>Upcoming calendar</Text>
-        <Text style={styles.sectionSubtext}>
-          DiaGuru tags its sessions with [DG]. External events stay untouched so your original plans remain.
-        </Text>
-        <View style={{ marginTop: 12, gap: 12 }}>{eventsContent}</View>
-      </View>
-    </ScrollView>
+        <View style={styles.captureSection}>
+          <Text style={styles.sectionTitle}>Upcoming calendar</Text>
+          <Text style={styles.sectionSubtext}>
+            DiaGuru tags its sessions with [DG]. External events stay untouched so your original plans remain.
+          </Text>
+          <View style={{ marginTop: 12, gap: 12 }}>{eventsContent}</View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -534,6 +561,9 @@ function EventRow({ e }: { e: SimpleEvent }) {
 }
 
 const styles = StyleSheet.create({
+  safeArea: { flex: 1, backgroundColor: '#F3F4F6' },
+  scroll: { flex: 1 },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 32, gap: 24 },
   captureSection: {
     backgroundColor: '#fff',
     borderRadius: 12,

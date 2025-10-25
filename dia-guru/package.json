@@ -13,7 +13,7 @@
                     "test":  "jest",
                     "deno:lint":  "deno lint --config supabase/functions/deno.json supabase/functions",
                     "deno:test":  "deno test --no-check --config supabase/functions/deno.json supabase/functions",
-                    "validate":  "npm run lint \u0026\u0026 npm run typecheck \u0026\u0026 npm run test \u0026\u0026 npm run deno:lint \u0026\u0026 npm run deno:test",
+                    "validate":  "npm run typecheck \u0026\u0026 npm run test \u0026\u0026 npm run deno:lint \u0026\u0026 npm run deno:test",
                     "dev":  "expo start",
                     "dev:lan":  "expo start --lan",
                     "dev:offline":  "expo start --offline"

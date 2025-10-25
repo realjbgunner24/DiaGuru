@@ -9,8 +9,8 @@ export default function TabsLayout() {
         options={{ title: 'Home', tabBarIcon: ({ color, size }) => <MaterialIcons name="home" size={size} color={color} /> }}
       />
       <Tabs.Screen
-        name="entries"
-        options={{ title: 'Entries', tabBarIcon: ({ color, size }) => <MaterialIcons name="list" size={size} color={color} /> }}
+        name="calendar"
+        options={{ title: 'Calendar', tabBarIcon: ({ color, size }) => <MaterialIcons name="calendar-today" size={size} color={color} /> }}
       />
       <Tabs.Screen
         name="profile"
