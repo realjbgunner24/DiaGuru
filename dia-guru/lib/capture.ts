@@ -1,3 +1,4 @@
+import { computePriorityScore } from './priority';
 import { supabase } from './supabase';
 
 export type CaptureStatus = 'pending' | 'scheduled' | 'awaiting_confirmation' | 'completed';
@@ -25,24 +26,6 @@ export type CaptureInput = {
   estimatedMinutes?: number | null;
   importance?: number;
 };
-
-function computePriorityScore(entry: {
-  estimated_minutes: number | null;
-  importance: number;
-  created_at: string;
-}) {
-  const minutes = entry.estimated_minutes ?? 30;
-  const cappedMinutes = Math.min(Math.max(minutes, 5), 240); // guard against extremes
-  const durationPenalty = cappedMinutes / 60; // minutes -> hours weight
-  const importanceBoost = entry.importance * 2;
-
-  const created = new Date(entry.created_at).getTime();
-  const recencyBoost = (Date.now() - created) / 1000 / 60 / 60 / 24; // days since capture
-
-  // Higher score bubbles up: importance has most weight, shorter tasks slightly higher,
-  // and older items get a small nudge so they are not forgotten.
-  return importanceBoost - durationPenalty + recencyBoost * 0.2;
-}
 
 export async function listCaptures(): Promise<Capture[]> {
   const { data, error } = await supabase

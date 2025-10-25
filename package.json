@@ -1,8 +1,19 @@
 {
+  "name": "diaguru-monorepo",
+  "private": true,
   "devDependencies": {
     "husky": "^9.1.7"
   },
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "start": "npm --prefix dia-guru run start",
+    "dev": "npm --prefix dia-guru run dev",
+    "lint": "npm --prefix dia-guru run lint",
+    "typecheck": "npm --prefix dia-guru run typecheck",
+    "test": "npm --prefix dia-guru run test",
+    "validate": "npm --prefix dia-guru run validate",
+    "deno:lint": "npm --prefix dia-guru run deno:lint",
+    "deno:check": "npm --prefix dia-guru run deno:check",
+    "deno:test": "npm --prefix dia-guru run deno:test"
   }
 }

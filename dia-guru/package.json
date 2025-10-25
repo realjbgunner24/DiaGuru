@@ -8,7 +8,13 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint",
+    "lint": "eslint . --ext .js,.jsx,.ts,.tsx --ignore-pattern supabase/functions/**",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "deno:lint": "deno lint --config supabase/functions/deno.json supabase/functions",
+    "deno:check": "deno check --config supabase/functions/deno.json supabase/functions/schedule-capture/index.ts supabase/functions/calendar-list/index.ts supabase/functions/oauth-cb/index.ts supabase/functions/sync-captures/index.ts",
+    "deno:test": "deno test --config supabase/functions/deno.json supabase/functions",
+    "validate": "npm run lint && npm run typecheck && npm run test && npm run deno:lint && npm run deno:check && npm run deno:test",
     "dev": "expo start",
     "dev:lan": "expo start --lan", 
     "dev:offline": "expo start --offline"
@@ -49,8 +55,14 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "@types/jest": "^29.5.14",
+    "@testing-library/jest-native": "^5.4.3",
+    "@testing-library/react-native": "^13.3.3",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
+    "jest": "^29.7.0",
+    "jest-expo": "~54.0.2",
+    "react-test-renderer": "19.1.0",
     "typescript": "~5.9.2"
   },
   "private": true
