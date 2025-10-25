@@ -194,10 +194,15 @@ export default function HomeTab() {
       return;
     }
 
-    const parsedMinutes = minutesInput ? Number(minutesInput) : undefined;
-    if (minutesInput && (Number.isNaN(parsedMinutes) || parsedMinutes <= 0)) {
-      Alert.alert('Check duration', 'Estimated minutes should be a positive number.');
-      return;
+    const trimmedMinutes = minutesInput.trim();
+    const hasMinutes = trimmedMinutes.length > 0;
+    let parsedMinutes: number | null = null;
+    if (hasMinutes) {
+      parsedMinutes = Number(trimmedMinutes);
+      if (Number.isNaN(parsedMinutes) || parsedMinutes <= 0) {
+        Alert.alert('Check duration', 'Estimated minutes should be a positive number.');
+        return;
+      }
     }
 
     try {
