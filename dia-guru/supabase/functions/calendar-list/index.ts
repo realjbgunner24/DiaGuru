@@ -6,6 +6,7 @@ type GEvent = {
   htmlLink?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
+  extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 };
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
@@ -108,6 +109,7 @@ Deno.serve(async (req) => {
       htmlLink: e.htmlLink,
       start: e.start,
       end: e.end,
+      extendedProperties: e.extendedProperties,
     }));
 
     return json({ items, timeMin, timeMax });

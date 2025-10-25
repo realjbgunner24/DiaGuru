@@ -27,12 +27,12 @@ Deno.serve(async (req) => {
     const clientSecret = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
     const redirectUri = Deno.env.get("GOOGLE_REDIRECT_URI")!;
 
-    // ✅ Verify user using the JWT we passed in `state`
+    // 0. Verify user using the JWT we passed in `state`
     const supaAnon = createClient(supabaseUrl, anon);
     const { data: { user } } = await supaAnon.auth.getUser(state);
     if (!user) return new Response("Unauthorized state", { status: 401 });
 
-    // Exchange code → tokens
+    // Exchange code for tokens
     const form = new URLSearchParams({
       code,
       client_id: clientId,
@@ -67,7 +67,7 @@ Deno.serve(async (req) => {
     const ok = `<!doctype html>
       <meta charset="utf-8">
       <title>Connected</title>
-      <h1>Google Calendar connected ✅</h1>
+      <h1>Google Calendar connected!</h1>
       <p>Version: ${VERSION}</p>`;
     return new Response(ok, { status: 200, headers: { "Content-Type": "text/html" } });
   } catch {

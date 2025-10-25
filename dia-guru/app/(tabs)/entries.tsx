@@ -31,6 +31,8 @@ export default function EntriesTab() {
   const [editBody, setEditBody] = useState('');
   const [editSaving, setEditSaving] = useState(false);
 
+  const sessionUserId = session?.user?.id;
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
   }, []);
@@ -45,10 +47,10 @@ export default function EntriesTab() {
   }
 
   useEffect(() => {
-    if (!session?.user) return;
+    if (!sessionUserId) return;
     setLoading(true);
     reload().finally(() => setLoading(false));
-  }, [session?.user?.id]);
+  }, [sessionUserId]);
 
   async function onRefresh() {
     setRefreshing(true);
@@ -57,13 +59,13 @@ export default function EntriesTab() {
   }
 
   async function onAdd() {
-    if (!session?.user) return;
+    if (!sessionUserId) return;
     const t = title.trim();
     const b = body.trim();
     if (!t && !b) return;
     try {
       setSaving(true);
-      const row = await addEntry(session.user.id, t, b);
+      const row = await addEntry(sessionUserId, t, b);
       setItems(prev => [row, ...prev]);
       setTitle(''); setBody('');
       Alert.alert('Saved', 'Entry added.');
@@ -139,7 +141,7 @@ export default function EntriesTab() {
               style={{ borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 8, padding: 10, minHeight: 80, backgroundColor: '#FFF', color: '#111827' }}
             />
             <View style={{ flexDirection: 'row', gap: 12 }}>
-              <Button title={editSaving ? 'Saving…' : 'Save'} onPress={saveEdit} disabled={editSaving} />
+              <Button title={editSaving ? 'Saving...' : 'Save'} onPress={saveEdit} disabled={editSaving} />
               <Button title="Cancel" onPress={cancelEdit} />
             </View>
           </View>
@@ -180,10 +182,10 @@ export default function EntriesTab() {
         multiline
         style={{ borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 8, padding: 10, minHeight: 80, backgroundColor: '#FFFFFF', color: '#111827' }}
       />
-      <Button title={saving ? 'Saving…' : 'Add'} onPress={onAdd} disabled={saving || (!title.trim() && !body.trim())} />
+      <Button title={saving ? 'Saving...' : 'Add'} onPress={onAdd} disabled={saving || (!title.trim() && !body.trim())} />
 
       {loading ? (
-        <Text style={{ color: '#111827' }}>Loading…</Text>
+        <Text style={{ color: '#111827' }}>Loading...</Text>
       ) : items.length === 0 ? (
         <Text style={{ color: '#6B7280' }}>No entries yet. Add your first one above.</Text>
       ) : (

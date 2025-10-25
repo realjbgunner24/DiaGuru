@@ -6,6 +6,7 @@ export type SimpleEvent = {
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   htmlLink?: string;
+  extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 };
 
 export async function fetchUpcomingEvents(rangeDays = 7) {

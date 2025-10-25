@@ -1,0 +1,324 @@
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
+
+type CalendarEvent = {
+  id: string;
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
+  extendedProperties?: { private?: Record<string, string> | null } | null;
+};
+
+type CaptureRow = {
+  id: string;
+  user_id: string;
+  status: string;
+  planned_start: string | null;
+  planned_end: string | null;
+  calendar_event_id: string | null;
+};
+
+class SyncError extends Error {
+  status: number;
+  details?: unknown;
+  constructor(message: string, status = 500, details?: unknown) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+Deno.serve(async (req) => {
+  try {
+    const auth = req.headers.get("Authorization");
+    if (!auth) throw new SyncError("Missing Authorization header", 401);
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const anon = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const serviceRole = Deno.env.get("SERVICE_ROLE_KEY")!;
+    const clientId = Deno.env.get("GOOGLE_CLIENT_ID")!;
+    const clientSecret = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
+
+    const supaFromUser = createClient(supabaseUrl, anon, {
+      global: { headers: { Authorization: auth } },
+    });
+    const { data: userData, error: userError } = await supaFromUser.auth.getUser();
+    if (userError || !userData?.user) throw new SyncError("Unauthorized", 401, userError);
+
+    const userId = userData.user.id;
+    const admin = createClient(supabaseUrl, serviceRole);
+
+    const { data: account, error: accountError } = await admin
+      .from("calendar_accounts")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("provider", "google")
+      .single();
+    if (accountError || !account) throw new SyncError("Google Calendar not linked", 400, accountError);
+
+    const { accessToken, refreshed } = await resolveAccessToken(
+      admin,
+      account.id,
+      clientId,
+      clientSecret,
+    );
+
+    const now = new Date();
+    const timeMin = new Date(now.getTime() - 3 * 86400000).toISOString(); // 3 days back
+    const timeMax = new Date(now.getTime() + 14 * 86400000).toISOString(); // 2 weeks forward
+
+    const events = await fetchDiaGuruEvents(accessToken, timeMin, timeMax);
+
+    const captureIdSet = new Set<string>();
+    for (const event of events) {
+      const captureId = event.extendedProperties?.private?.capture_id;
+      if (captureId) captureIdSet.add(captureId);
+    }
+
+    const captureIds = Array.from(captureIdSet);
+    const { data: captureRows } = captureIds.length
+      ? await admin
+          .from("capture_entries")
+          .select("id, user_id, status, planned_start, planned_end, calendar_event_id")
+          .eq("user_id", userId)
+          .in("id", captureIds)
+      : { data: [] as CaptureRow[] };
+
+    const capturesById = new Map<string, CaptureRow>();
+    for (const row of (captureRows ?? []) as CaptureRow[]) {
+      capturesById.set(row.id, row);
+    }
+
+    const { data: scheduledRows } = await admin
+      .from("capture_entries")
+      .select("id, user_id, status, planned_start, planned_end, calendar_event_id")
+      .eq("user_id", userId)
+      .eq("status", "scheduled");
+
+    const scheduledCaptures = (scheduledRows ?? []) as CaptureRow[];
+
+    const scheduledUpdates: {
+      id: string;
+      planned_start: string;
+      planned_end: string;
+      calendar_event_id: string;
+    }[] = [];
+    const pendingResets: { id: string }[] = [];
+
+    for (const event of events) {
+      const captureId = event.extendedProperties?.private?.capture_id;
+      if (!captureId) continue;
+      const start = parseEventDate(event.start);
+      const end = parseEventDate(event.end);
+      if (!start || !end) continue;
+
+      const capture = capturesById.get(captureId);
+      const plannedStart = start.toISOString();
+      const plannedEnd = end.toISOString();
+      if (
+        capture &&
+        (capture.planned_start !== plannedStart ||
+          capture.planned_end !== plannedEnd ||
+          capture.calendar_event_id !== event.id ||
+          capture.status !== "scheduled")
+      ) {
+        scheduledUpdates.push({
+          id: capture.id,
+          planned_start: plannedStart,
+          planned_end: plannedEnd,
+          calendar_event_id: event.id,
+        });
+      }
+    }
+
+    const scheduledIdsWithEvents = new Set(
+      events
+        .map((event) => event.extendedProperties?.private?.capture_id)
+        .filter((value): value is string => Boolean(value)),
+    );
+
+    for (const capture of scheduledCaptures) {
+      if (!scheduledIdsWithEvents.has(capture.id)) {
+        pendingResets.push({ id: capture.id });
+      }
+    }
+
+    let updateCount = 0;
+
+    for (const change of scheduledUpdates) {
+      const { id, ...rest } = change;
+      const { error } = await admin
+        .from("capture_entries")
+        .update({
+          ...rest,
+          status: "scheduled",
+          scheduling_notes: "Synced from Google Calendar.",
+        })
+        .eq("id", id)
+        .eq("user_id", userId);
+      if (error) throw new SyncError("Failed to update capture", 500, error);
+      updateCount++;
+    }
+
+    for (const reset of pendingResets) {
+      const { error } = await admin
+        .from("capture_entries")
+        .update({
+          status: "pending",
+          planned_start: null,
+          planned_end: null,
+          calendar_event_id: null,
+          scheduling_notes: "Google Calendar event missing; returned to queue.",
+        })
+        .eq("id", reset.id)
+        .eq("user_id", userId);
+      if (error) throw new SyncError("Failed to reset missing capture", 500, error);
+      updateCount++;
+    }
+
+    return json({
+      message: "Sync complete",
+      refreshedToken: refreshed,
+      updates: updateCount,
+      scannedEvents: events.length,
+      timeMin,
+      timeMax,
+    });
+  } catch (error) {
+    if (error instanceof SyncError) {
+      return json({ error: error.message, details: error.details ?? null }, error.status);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return json({ error: "Server error", details: message }, 500);
+  }
+});
+
+async function resolveAccessToken(
+  admin: ReturnType<typeof createClient>,
+  accountId: number,
+  clientId: string,
+  clientSecret: string,
+) {
+  const { data: tokenRow, error: tokenError } = await admin
+    .from("calendar_tokens")
+    .select("access_token, refresh_token, expiry")
+    .eq("account_id", accountId)
+    .single();
+  if (tokenError || !tokenRow) throw new SyncError("Missing Google token", 400, tokenError);
+
+  let accessToken = tokenRow.access_token as string;
+  const refreshToken = tokenRow.refresh_token as string | null;
+  const expiry = tokenRow.expiry ? Date.parse(tokenRow.expiry) : 0;
+  const aboutToExpire = expiry <= Date.now() + 30_000;
+  let refreshed = false;
+
+  if (aboutToExpire && refreshToken) {
+    const body = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    });
+
+    const res = await fetch(GOOGLE_TOKEN, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const payload = await safeParse(res);
+    if (!res.ok) throw new SyncError("Failed to refresh Google token", res.status, payload);
+
+    accessToken = (payload as any).access_token;
+    const expiresIn = (payload as any).expires_in ?? 0;
+    const newExpiry = new Date(Date.now() + expiresIn * 1000).toISOString();
+    await admin.from("calendar_tokens").upsert({
+      account_id: accountId,
+      access_token: accessToken,
+      refresh_token: (payload as any).refresh_token ?? refreshToken,
+      expiry: newExpiry,
+    });
+    refreshed = true;
+  }
+
+  return { accessToken, refreshed };
+}
+
+async function fetchDiaGuruEvents(accessToken: string, timeMin: string, timeMax: string) {
+  const url = new URL(GOOGLE_EVENTS);
+  url.searchParams.set("singleEvents", "true");
+  url.searchParams.set("orderBy", "startTime");
+  url.searchParams.set("timeMin", timeMin);
+  url.searchParams.set("timeMax", timeMax);
+  url.searchParams.set("maxResults", "250");
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const payload = await safeParse(res);
+  if (!res.ok) {
+    throw new SyncError(
+      extractGoogleError(payload) ?? `Google events fetch failed (status ${res.status})`,
+      res.status,
+      payload,
+    );
+  }
+
+  const items = (payload && typeof payload === "object" ? (payload as any).items : null) ?? [];
+  return (items as CalendarEvent[]).filter((event) => {
+    const captureId = event.extendedProperties?.private?.capture_id;
+    const tagged =
+      event.extendedProperties?.private?.diaGuru === "true" ||
+      (event as any).summary?.startsWith?.("[DG]");
+    return Boolean(captureId) || tagged;
+  });
+}
+
+function parseEventDate(value?: { dateTime?: string; date?: string } | null) {
+  if (!value) return null;
+  if (value.dateTime) return new Date(value.dateTime);
+  if (value.date) return new Date(`${value.date}T00:00:00Z`);
+  return null;
+}
+
+async function safeParse(res: Response) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function extractGoogleError(payload: unknown) {
+  if (!payload) return null;
+  if (typeof payload === "string") return payload;
+  if (typeof payload !== "object") return null;
+
+  const top = payload as Record<string, unknown>;
+  if (typeof top.error === "string" && top.error.trim()) return top.error;
+  if (top.error && typeof top.error === "object") {
+    const nested = top.error as Record<string, unknown>;
+    if (typeof nested.message === "string" && nested.message.trim()) return nested.message;
+    if (Array.isArray(nested.errors) && nested.errors.length > 0) {
+      const first = nested.errors[0] as Record<string, unknown>;
+      if (typeof first.message === "string" && first.message.trim()) return first.message;
+      if (typeof first.reason === "string" && first.reason.trim()) return first.reason;
+    }
+  }
+  if (typeof top.message === "string" && top.message.trim()) return top.message;
+  if (Array.isArray(top.errors) && top.errors.length > 0) {
+    const first = top.errors[0] as Record<string, unknown>;
+    if (typeof first.message === "string" && first.message.trim()) return first.message;
+  }
+
+  return null;
+}
+
+function json(data: any, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
