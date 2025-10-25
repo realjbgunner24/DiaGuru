@@ -1,0 +1,7 @@
+{
+  "compilerOptions": { "lib": ["deno.ns", "dom"] },
+  "functions": {
+    "oauth-cb": { "verify_jwt": false },
+    "calendar-list": { "verify_jwt": true }
+  }
+}
