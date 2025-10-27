@@ -13,12 +13,12 @@ export default function SignIn() {
     // If already signed in, skip auth screen
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (!mounted) return;
-      if (session) router.replace('/(tabs)');        // or '/(tabs)/profile' if you prefer
+      if (session) router.replace({ pathname: '/(tabs)' }); // or '/(tabs)/profile' if you prefer
     });
 
     // After clicking "Sign in", navigate when session arrives
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      if (s) router.replace('/(tabs)');              // or '/(tabs)/profile'
+      if (s) router.replace({ pathname: '/(tabs)' }); // or '/(tabs)/profile'
     });
 
     return () => { mounted = false; sub.subscription.unsubscribe(); };
@@ -26,3 +26,4 @@ export default function SignIn() {
 
   return <Auth />;  // your existing component, unchanged
 }
+

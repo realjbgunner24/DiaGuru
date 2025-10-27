@@ -1,4 +1,6 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
@@ -26,20 +28,7 @@ type CalendarEvent = {
   extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 };
 
-type CaptureEntry = {
-  id: string;
-  user_id: string;
-  content: string;
-  estimated_minutes: number | null;
-  importance: number;
-  status: string;
-  calendar_event_id: string | null;
-  planned_start: string | null;
-  planned_end: string | null;
-  last_check_in: string | null;
-};
-
-Deno.serve(async (req) => {
+export async function handler(req: Request) {
   try {
     const auth = req.headers.get("Authorization");
     if (!auth) return json({ error: "Missing Authorization" }, 401);
@@ -47,6 +36,10 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(() => ({}));
     const captureId = body.captureId as string | undefined;
     const action = (body.action as "schedule" | "reschedule" | "complete") ?? "schedule";
+    const timezoneOffsetMinutes =
+      typeof body.timezoneOffsetMinutes === "number" && Number.isFinite(body.timezoneOffsetMinutes)
+        ? body.timezoneOffsetMinutes
+        : null;
 
     if (!captureId) return json({ error: "captureId required" }, 400);
 
@@ -56,14 +49,14 @@ Deno.serve(async (req) => {
     const clientId = Deno.env.get("GOOGLE_CLIENT_ID")!;
     const clientSecret = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
 
-    const supaFromUser = createClient(supabaseUrl, anon, {
+    const supaFromUser = createClient<Database, "public">(supabaseUrl, anon, {
       global: { headers: { Authorization: auth } },
     });
     const { data: userData, error: userError } = await supaFromUser.auth.getUser();
     if (userError || !userData?.user) return json({ error: "Unauthorized" }, 401);
 
     const userId = userData.user.id;
-    const admin = createClient(supabaseUrl, serviceRole);
+    const admin = createClient<Database, "public">(supabaseUrl, serviceRole);
 
     const { data: capture, error: captureError } = await admin
       .from("capture_entries")
@@ -119,7 +112,7 @@ Deno.serve(async (req) => {
     }
 
     const durationMinutes = Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
-    const candidate = await findNextAvailableSlot(accessToken, durationMinutes);
+    const candidate = await findNextAvailableSlot(accessToken, durationMinutes, timezoneOffsetMinutes);
     if (!candidate) {
       return json({ error: "No available slot within the next week." }, 409);
     }
@@ -158,10 +151,14 @@ Deno.serve(async (req) => {
     const fallbackMessage = error instanceof Error ? error.message : String(error);
     return json({ error: "Server error", details: fallbackMessage }, 500);
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(handler);
+}
 
 async function resolveCalendarClient(
-  admin: ReturnType<typeof createClient>,
+  admin: SupabaseClient<Database, "public">,
   userId: string,
   clientId: string,
   clientSecret: string,
@@ -181,16 +178,28 @@ async function resolveCalendarClient(
     .single();
   if (tokenError || !tokenRow) return null;
 
-  let accessToken = tokenRow.access_token as string;
-  const refreshToken = tokenRow.refresh_token as string | null;
-  const expiry = tokenRow.expiry ? Date.parse(tokenRow.expiry) : 0;
+  const typedToken = tokenRow as CalendarTokenRow;
+
+  let accessToken = typedToken.access_token;
+  const refreshToken = typedToken.refresh_token;
+  const expiry = typedToken.expiry ? Date.parse(typedToken.expiry) : 0;
   const aboutToExpire = expiry <= Date.now() + 30_000;
 
   if (aboutToExpire && refreshToken) {
     const refreshed = await refreshGoogleToken(refreshToken, clientId, clientSecret);
     if (!refreshed) return null;
     accessToken = refreshed.access_token;
-    await admin.from("calendar_tokens").upsert({
+    const calendarTokens = admin.from("calendar_tokens") as unknown as {
+      upsert: (
+        values: {
+          account_id: number;
+          access_token: string;
+          refresh_token: string | null;
+          expiry: string;
+        },
+      ) => Promise<unknown>;
+    };
+    await calendarTokens.upsert({
       account_id: account.id,
       access_token: refreshed.access_token,
       refresh_token: refreshed.refresh_token ?? refreshToken,
@@ -218,7 +227,14 @@ async function refreshGoogleToken(refreshToken: string, clientId: string, client
   return await res.json();
 }
 
-async function findNextAvailableSlot(accessToken: string, durationMinutes: number) {
+async function findNextAvailableSlot(
+  accessToken: string,
+  durationMinutes: number,
+  timezoneOffsetMinutes: number | null,
+) {
+  const offset = typeof timezoneOffsetMinutes === "number" && Number.isFinite(timezoneOffsetMinutes)
+    ? timezoneOffsetMinutes
+    : 0;
   const now = new Date();
   const timeMin = now.toISOString();
   const timeMax = new Date(now.getTime() + SEARCH_DAYS * 86400000).toISOString();
@@ -233,20 +249,23 @@ async function findNextAvailableSlot(accessToken: string, durationMinutes: numbe
         start: addMinutes(start, -BUFFER_MINUTES),
         end: addMinutes(end, BUFFER_MINUTES),
       };
-    })
-    .filter(Boolean) as { start: Date; end: Date }[];
+  })
+  .filter(Boolean) as { start: Date; end: Date }[];
 
   intervals.sort((a, b) => a.start.getTime() - b.start.getTime());
 
-  let cursor = new Date(now.getTime());
-  cursor.setMinutes(cursor.getMinutes() + 5);
+  let cursor = addMinutes(now, 5);
+  if (isBeforeDayStart(cursor, offset)) {
+    cursor = startOfDayOffset(now, offset);
+  }
 
   for (let day = 0; day < SEARCH_DAYS; day++) {
-    const dayStart = startOfDay(addDays(now, day));
+    const dayStart = startOfDayOffset(addDays(now, day), offset);
     let candidateStart = new Date(Math.max(dayStart.getTime(), cursor.getTime()));
-    while (candidateStart.getHours() < DAY_END_HOUR) {
+    while (true) {
+      if (isAfterDayEnd(candidateStart, offset)) break;
       const candidateEnd = addMinutes(candidateStart, durationMinutes);
-      if (candidateEnd.getHours() >= DAY_END_HOUR && candidateEnd.getMinutes() > 0) break;
+      if (isAfterDayEnd(candidateEnd, offset)) break;
 
       if (isSlotFree(candidateStart, candidateEnd, intervals)) {
         return { start: candidateStart, end: candidateEnd };
@@ -254,7 +273,7 @@ async function findNextAvailableSlot(accessToken: string, durationMinutes: numbe
 
       candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
     }
-    cursor = startOfDay(addDays(now, day + 1));
+    cursor = startOfDayOffset(addDays(now, day + 1), offset);
   }
 
   return null;
@@ -277,8 +296,12 @@ async function listCalendarEvents(accessToken: string, timeMin: string, timeMax:
       extractGoogleError(payload) ?? `Google events fetch failed (status ${res.status})`;
     throw new ScheduleError(message, res.status, payload);
   }
-  const items = (payload && typeof payload === "object" ? (payload as any).items : null) ?? [];
-  return items as CalendarEvent[];
+  const itemsValue =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).items
+      : null;
+  const rawItems = Array.isArray(itemsValue) ? (itemsValue as unknown[]) : [];
+  return rawItems as CalendarEvent[];
 }
 
 async function deleteCalendarEvent(accessToken: string, eventId: string) {
@@ -290,7 +313,7 @@ async function deleteCalendarEvent(accessToken: string, eventId: string) {
 
 async function createCalendarEvent(
   accessToken: string,
-  capture: CaptureEntry,
+  capture: CaptureEntryRow,
   slot: { start: Date; end: Date },
 ) {
   const summary = `[DG] ${capture.content}`.slice(0, 200);
@@ -346,10 +369,32 @@ function addDays(date: Date, days: number) {
   return next;
 }
 
-function startOfDay(date: Date) {
-  const start = new Date(date.getTime());
+function startOfDayOffset(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  local.setHours(8, 0, 0, 0);
+  return toUtcDate(local, offsetMinutes);
+}
+
+function isBeforeDayStart(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  const start = new Date(local.getTime());
   start.setHours(8, 0, 0, 0);
-  return start;
+  return local.getTime() < start.getTime();
+}
+
+function isAfterDayEnd(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  if (local.getHours() > DAY_END_HOUR) return true;
+  if (local.getHours() === DAY_END_HOUR && local.getMinutes() > 0) return true;
+  return false;
+}
+
+function toLocalDate(date: Date, offsetMinutes: number) {
+  return new Date(date.getTime() + offsetMinutes * 60000);
+}
+
+function toUtcDate(date: Date, offsetMinutes: number) {
+  return new Date(date.getTime() - offsetMinutes * 60000);
 }
 
 function isSlotFree(start: Date, end: Date, intervals: { start: Date; end: Date }[]) {
@@ -396,7 +441,7 @@ function extractGoogleError(payload: unknown) {
   return null;
 }
 
-function json(data: any, status = 200) {
+function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json" },

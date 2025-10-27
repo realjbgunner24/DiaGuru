@@ -1,4 +1,4 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "@supabase/supabase-js";
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const VERSION = "cb-v1";

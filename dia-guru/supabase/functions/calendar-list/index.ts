@@ -1,4 +1,4 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "@supabase/supabase-js";
 
 type GEvent = {
   id: string;
@@ -103,14 +103,18 @@ Deno.serve(async (req) => {
     const gj = await gr.json();
     if (!gr.ok) return json({ error: "Google API error", details: gj }, 502);
 
-    const items: GEvent[] = (gj.items ?? []).map((e: any) => ({
-      id: e.id,
-      summary: e.summary,
-      htmlLink: e.htmlLink,
-      start: e.start,
-      end: e.end,
-      extendedProperties: e.extendedProperties,
-    }));
+    const rawItems = Array.isArray(gj.items) ? (gj.items as unknown[]) : [];
+    const items: GEvent[] = rawItems.map((entry) => {
+      const record = entry as Record<string, unknown>;
+      return {
+        id: String(record.id ?? ""),
+        summary: record.summary as string | undefined,
+        htmlLink: record.htmlLink as string | undefined,
+        start: record.start as GEvent["start"],
+        end: record.end as GEvent["end"],
+        extendedProperties: record.extendedProperties as GEvent["extendedProperties"],
+      };
+    });
 
     return json({ items, timeMin, timeMax });
   } catch (e) {
@@ -118,7 +122,7 @@ Deno.serve(async (req) => {
   }
 });
 
-function json(data: any, status = 200) {
+function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json" },

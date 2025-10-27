@@ -1,8 +1,13 @@
 {
   "compilerOptions": { "lib": ["deno.ns", "dom"] },
+  "imports": {
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2",
+    "std/assert": "https://deno.land/std@0.208.0/assert/mod.ts"
+  },
   "functions": {
     "oauth-cb": { "verify_jwt": false },
     "calendar-list": { "verify_jwt": true },
-    "sync-captures": { "verify_jwt": true }
+    "sync-captures": { "verify_jwt": true },
+    "parse-task": { "verify_jwt": true }
   }
 }

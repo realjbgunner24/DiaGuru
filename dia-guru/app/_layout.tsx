@@ -12,8 +12,8 @@ function AuthGate() {
   useEffect(() => {
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       const inAuth = segments[0] === '(auth)';
-      if (!session && !inAuth) router.replace('/(auth)/sign-in');
-      if (session && inAuth) router.replace('/(tabs)'); // or '/(tabs)/profile'
+      if (!session && !inAuth) router.replace({ pathname: '/(auth)/sign-in' });
+      if (session && inAuth) router.replace({ pathname: '/(tabs)' }); // or '/(tabs)/profile'
     });
     return () => sub.subscription.unsubscribe();
   }, [router, segments]);
@@ -35,3 +35,4 @@ export default function RootLayout() {
     </ThemeProvider>
   );
 }
+

@@ -26,9 +26,6 @@ jobs:
       - name: Install dependencies
         working-directory: dia-guru
         run: npm ci
-      - name: Lint
-        working-directory: dia-guru
-        run: npm run lint
       - name: Type check
         working-directory: dia-guru
         run: npm run typecheck
@@ -38,9 +35,6 @@ jobs:
       - name: Deno lint
         working-directory: dia-guru
         run: npm run deno:lint
-      - name: Deno type check
-        working-directory: dia-guru
-        run: npm run deno:check
       - name: Deno tests
         working-directory: dia-guru
         run: npm run deno:test

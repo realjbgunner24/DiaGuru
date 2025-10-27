@@ -1,5 +1,5 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSupabaseSession } from '@/hooks/useSupabaseSession';
-import { fetchUpcomingEvents, SimpleEvent } from '@/lib/calendar';
 import {
   addCapture,
   Capture,
@@ -8,13 +8,25 @@ import {
   invokeScheduleCapture,
   listCaptures,
   listScheduledCaptures,
+  parseCapture,
+  ParseMode,
+  ParseTaskResponse,
+  ScheduleDecision,
+  ScheduleOptions,
   syncCaptureEvents,
 } from '@/lib/capture';
+import {
+  cancelScheduledNotification,
+  scheduleReminderAt,
+} from '@/lib/notifications';
+import { getAssistantModePreference } from '@/lib/preferences';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Linking,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -23,12 +35,31 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const IMPORTANCE_LEVELS = [
   { value: 1, label: 'Low' },
   { value: 2, label: 'Medium' },
   { value: 3, label: 'High' },
 ];
+
+const REMINDER_STORAGE_KEY = '@diaGuru.reminders';
+
+type PendingCaptureState = {
+  baseContent: string;
+  importance: number;
+  appended: string[];
+  preferredStart?: string | null;
+  preferredEnd?: string | null;
+  mode: ParseMode;
+};
+
+type ReminderEntry = {
+  notificationId: string;
+  plannedEnd: string;
+};
+
+type ReminderRegistry = Record<string, ReminderEntry>;
 
 function extractScheduleError(error: unknown) {
   if (!error) return 'Unable to schedule this item.';
@@ -50,14 +81,94 @@ function extractScheduleError(error: unknown) {
   return 'Unable to schedule this item.';
 }
 
+function extractPreferredFromParse(result: ParseTaskResponse | null | undefined) {
+  if (!result) return null;
+  const structured = result.structured ?? {};
+  const window = structured.window;
+  if (window?.start && window?.end) {
+    return { start: window.start, end: window.end };
+  }
+  if (window?.start) {
+    return { start: window.start, end: window.end ?? null };
+  }
+  if (structured.datetime) {
+    return { start: structured.datetime, end: window?.end ?? null };
+  }
+  return null;
+}
+
+function computePreferredSlot(
+  preferred: { start?: string | null; end?: string | null } | null,
+  durationMinutes: number | null,
+) {
+  if (!preferred?.start) return null;
+  const start = new Date(preferred.start);
+  if (Number.isNaN(start.getTime())) return null;
+  let endIso: string | undefined;
+  if (preferred.end) {
+    const parsedEnd = new Date(preferred.end);
+    if (!Number.isNaN(parsedEnd.getTime())) {
+      endIso = parsedEnd.toISOString();
+    }
+  }
+  if (!endIso && durationMinutes && durationMinutes > 0) {
+    endIso = new Date(start.getTime() + durationMinutes * 60000).toISOString();
+  }
+  return {
+    start: start.toISOString(),
+    end: endIso,
+  };
+}
+
+function formatConflictMessage(decision: ScheduleDecision) {
+  const lines = [decision.message.trim()];
+  if (decision.conflicts.length > 0) {
+    lines.push('', 'Conflicts:');
+    for (const conflict of decision.conflicts) {
+      const label = conflict.summary?.trim() || 'Busy block';
+      const startText = conflict.start ? new Date(conflict.start).toLocaleString() : 'unknown';
+      const endText = conflict.end
+        ? new Date(conflict.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '';
+      const suffix = conflict.diaGuru ? ' (DiaGuru)' : '';
+      const details = `${startText}${endText ? ` -> ${endText}` : ''}`;
+      lines.push(`- ${label}${suffix}: ${details}`);
+    }
+  }
+  if (decision.suggestion) {
+    const suggestionStart = new Date(decision.suggestion.start).toLocaleString();
+    const suggestionEnd = new Date(decision.suggestion.end).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    lines.push('', `Next available slot: ${suggestionStart} -> ${suggestionEnd}`);
+  }
+  return lines.join('\n');
+}
+
 export default function HomeTab() {
   const { session } = useSupabaseSession();
   const userId = session?.user?.id ?? null;
+  const insets = useSafeAreaInsets();
+  const timezone = useMemo(() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC';
+    } catch {
+      return 'UTC';
+    }
+  }, []);
+  const timezoneOffsetMinutes = useMemo(() => -new Date().getTimezoneOffset(), []);
 
   const [idea, setIdea] = useState('');
   const [minutesInput, setMinutesInput] = useState('');
   const [importance, setImportance] = useState(2);
   const [submitting, setSubmitting] = useState(false);
+  const [pendingCapture, setPendingCapture] = useState<PendingCaptureState | null>(null);
+  const [followUpState, setFollowUpState] = useState<{
+    prompt: string;
+    missing: string[];
+  } | null>(null);
+  const [followUpAnswer, setFollowUpAnswer] = useState('');
 
   const [pending, setPending] = useState<Capture[]>([]);
   const [scheduled, setScheduled] = useState<Capture[]>([]);
@@ -66,33 +177,100 @@ export default function HomeTab() {
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [scheduledError, setScheduledError] = useState<string | null>(null);
 
-  const [events, setEvents] = useState<SimpleEvent[]>([]);
-  const [eventsLoading, setEventsLoading] = useState(true);
-  const [eventsError, setEventsError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const [scheduling, setScheduling] = useState(false);
   const [actionCaptureId, setActionCaptureId] = useState<string | null>(null);
 
   const autoSchedulingRef = useRef(false);
+  const reminderRegistryRef = useRef<ReminderRegistry>({});
+  const reminderSyncingRef = useRef(false);
+  const [reminderLoaded, setReminderLoaded] = useState(false);
 
-  const loadEvents = useCallback(
-    async (showSpinner: boolean) => {
-      if (showSpinner) setEventsLoading(true);
-      setEventsError(null);
+  useEffect(() => {
+    let active = true;
+    (async () => {
       try {
-        const list = await fetchUpcomingEvents(7);
-        setEvents(list);
-      } catch (error: any) {
-        setEventsError(error?.message ?? 'Failed to load calendar events');
+        const stored = await AsyncStorage.getItem(REMINDER_STORAGE_KEY);
+        if (stored && active) {
+          reminderRegistryRef.current = JSON.parse(stored) as ReminderRegistry;
+        }
+      } catch (error) {
+        console.log('reminder registry load failed', error);
       } finally {
-        if (showSpinner) {
-          setEventsLoading(false);
+        if (active) setReminderLoaded(true);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const ensureReminders = useCallback(async () => {
+    if (!reminderLoaded) return;
+    if (reminderSyncingRef.current) return;
+    reminderSyncingRef.current = true;
+    try {
+      const registry = reminderRegistryRef.current;
+      const nextRegistry: ReminderRegistry = {};
+      const now = Date.now();
+
+      for (const capture of scheduled) {
+        if (capture.status !== 'scheduled') continue;
+        if (!capture.planned_end) continue;
+
+        const endDate = new Date(capture.planned_end);
+        if (Number.isNaN(endDate.getTime())) continue;
+
+        if (endDate.getTime() <= now) {
+          const existing = registry[capture.id];
+          if (existing) {
+            await cancelScheduledNotification(existing.notificationId);
+          }
+          continue;
+        }
+
+        const existing = registry[capture.id];
+        if (existing && existing.plannedEnd === capture.planned_end) {
+          nextRegistry[capture.id] = existing;
+          continue;
+        }
+
+        if (existing) {
+          await cancelScheduledNotification(existing.notificationId);
+        }
+
+        try {
+          const notificationId = await scheduleReminderAt(
+            endDate,
+            'Time to check in',
+            `Did you complete "${capture.content}"?`,
+          );
+          nextRegistry[capture.id] = { notificationId, plannedEnd: capture.planned_end };
+        } catch (error) {
+          console.log('reminder schedule failed', error);
         }
       }
-    },
-    [],
-  );
+
+      for (const [captureId, entry] of Object.entries(registry)) {
+        if (!nextRegistry[captureId]) {
+          await cancelScheduledNotification(entry.notificationId);
+        }
+      }
+
+      reminderRegistryRef.current = nextRegistry;
+      await AsyncStorage.setItem(REMINDER_STORAGE_KEY, JSON.stringify(nextRegistry));
+    } catch (error) {
+      console.log('reminder sync failed', error);
+    } finally {
+      reminderSyncingRef.current = false;
+    }
+  }, [reminderLoaded, scheduled]);
+
+  useEffect(() => {
+    if (!reminderLoaded) return;
+    ensureReminders();
+  }, [ensureReminders, reminderLoaded]);
 
   const loadPending = useCallback(async () => {
     if (!userId) return [];
@@ -126,10 +304,6 @@ export default function HomeTab() {
     }
   }, [userId]);
 
-  useEffect(() => {
-    loadEvents(true);
-  }, [loadEvents]);
-
   const synchronizeFromCalendar = useCallback(async () => {
     if (!userId) return;
     try {
@@ -152,35 +326,200 @@ export default function HomeTab() {
     setRefreshing(true);
     try {
       await synchronizeFromCalendar();
-      await Promise.all([loadEvents(false), loadPending(), loadScheduled()]);
+      await Promise.all([loadPending(), loadScheduled()]);
     } catch (error) {
       console.log('refresh sync error', error);
     } finally {
       setRefreshing(false);
     }
-  }, [loadEvents, loadPending, loadScheduled, synchronizeFromCalendar, userId]);
+  }, [loadPending, loadScheduled, synchronizeFromCalendar, userId]);
 
   const scheduleTopCapture = useCallback(
-    async (captureId?: string, mode: 'schedule' | 'reschedule' = 'schedule') => {
-      if (!userId) return;
-      const topId = captureId ?? pending[0]?.id;
-      if (!topId) return;
-      if (autoSchedulingRef.current) return;
+    async (
+      captureId?: string,
+      mode: 'schedule' | 'reschedule' = 'schedule',
+      options?: ScheduleOptions,
+    ) => {
+      if (!userId) return null;
+      const targetId = captureId ?? pending[0]?.id;
+      if (!targetId) return null;
+      if (autoSchedulingRef.current) return null;
       autoSchedulingRef.current = true;
       try {
         setScheduling(true);
-        await invokeScheduleCapture(topId, mode);
-        await Promise.all([loadPending(), loadScheduled(), loadEvents(false)]);
+        const response = await invokeScheduleCapture(targetId, mode, {
+          timezone,
+          timezoneOffsetMinutes,
+          ...(options ?? {}),
+        });
+        await Promise.all([loadPending(), loadScheduled()]);
+        return response;
       } catch (error) {
         console.log('schedule-capture error', error);
         Alert.alert('Scheduling failed', extractScheduleError(error));
+        return null;
       } finally {
         setScheduling(false);
         autoSchedulingRef.current = false;
       }
     },
-    [loadEvents, loadPending, loadScheduled, pending, userId],
+    [loadPending, loadScheduled, pending, timezone, timezoneOffsetMinutes, userId],
   );
+
+  const finalizeCapture = useCallback(
+    async (content: string, estimatedMinutes: number | null, selectedImportance: number) => {
+      if (!userId) {
+        throw new Error('Sign in required');
+      }
+
+      const created = await addCapture(
+        {
+          content,
+          estimatedMinutes,
+          importance: selectedImportance,
+        },
+        userId,
+      );
+
+      setIdea('');
+      setMinutesInput('');
+      setImportance(2);
+      setPendingCapture(null);
+
+      await loadPending();
+      return created;
+    },
+    [loadPending, userId],
+  );
+
+  const attemptSchedule = useCallback(
+    async (captureId: string, preferred?: { start: string; end?: string | null }) => {
+      const baseOptions: ScheduleOptions | undefined = preferred
+        ? {
+            preferredStart: preferred.start,
+            ...(preferred.end ? { preferredEnd: preferred.end } : {}),
+          }
+        : undefined;
+
+      const response = await scheduleTopCapture(captureId, 'schedule', baseOptions);
+      const decision = response?.decision;
+      if (decision?.type === 'preferred_conflict' && preferred) {
+        const message = formatConflictMessage(decision);
+        Alert.alert('Time conflict', message, [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Overlap anyway',
+            onPress: () =>
+              scheduleTopCapture(captureId, 'schedule', {
+                ...(baseOptions ?? {}),
+                allowOverlap: true,
+              }),
+          },
+          {
+            text: 'Let DiaGuru decide',
+            onPress: () => scheduleTopCapture(captureId, 'schedule'),
+          },
+        ]);
+      }
+      return response;
+    },
+    [scheduleTopCapture],
+  );
+
+  const handleFollowUpCancel = useCallback(() => {
+    setFollowUpState(null);
+    setFollowUpAnswer('');
+    setPendingCapture(null);
+    setSubmitting(false);
+  }, []);
+
+  const handleFollowUpSubmit = useCallback(async () => {
+    if (!followUpState || !pendingCapture) return;
+    const answer = followUpAnswer.trim();
+    if (!answer) {
+      Alert.alert('Need a response', 'Please answer the question so DiaGuru can schedule this.');
+      return;
+    }
+
+    const nextAppended = [...pendingCapture.appended, answer];
+
+    try {
+      setSubmitting(true);
+
+      let resolvedMinutes: number | null = null;
+      const preferredBase: { start?: string | null; end?: string | null } = {
+        start: pendingCapture.preferredStart ?? null,
+        end: pendingCapture.preferredEnd ?? null,
+      };
+
+      try {
+        const parseResult = await parseCapture({
+          text: [pendingCapture.baseContent, ...nextAppended].join('\n'),
+          mode: pendingCapture.mode,
+          timezone,
+          now: new Date().toISOString(),
+        });
+        const extracted = extractPreferredFromParse(parseResult);
+        if (extracted?.start) preferredBase.start = extracted.start;
+        if (extracted?.end) preferredBase.end = extracted.end;
+        const candidate = parseResult.structured?.estimated_minutes;
+        if (typeof candidate === 'number' && candidate > 0) {
+          resolvedMinutes = candidate;
+        } else if (parseResult.follow_up) {
+          setPendingCapture({
+            baseContent: pendingCapture.baseContent,
+            importance: pendingCapture.importance,
+            appended: nextAppended,
+            preferredStart: extracted?.start ?? pendingCapture.preferredStart ?? null,
+            preferredEnd: extracted?.end ?? pendingCapture.preferredEnd ?? null,
+            mode: pendingCapture.mode,
+          });
+          setFollowUpState({
+            prompt: parseResult.follow_up.prompt,
+            missing: parseResult.follow_up.missing ?? [],
+          });
+          setFollowUpAnswer('');
+          setSubmitting(false);
+          return;
+        }
+      } catch (error) {
+        console.log('follow-up parse failed', error);
+      }
+
+      if (resolvedMinutes === null) {
+        const numericMatch = answer.match(/(\d+(?:\.\d+)?)/);
+        if (numericMatch) {
+          const numeric = Number(numericMatch[1]);
+          if (!Number.isNaN(numeric) && numeric > 0) {
+            resolvedMinutes = Math.round(numeric);
+          }
+        }
+      }
+
+      if (resolvedMinutes === null) {
+        Alert.alert('Need a duration', 'Please provide the estimated minutes (for example, 45).');
+        setSubmitting(false);
+        return;
+      }
+
+      const capture = await finalizeCapture(
+        pendingCapture.baseContent,
+        resolvedMinutes,
+        pendingCapture.importance,
+      );
+
+      setFollowUpState(null);
+      setFollowUpAnswer('');
+      setPendingCapture(null);
+
+      const preferredSlot = computePreferredSlot(preferredBase, resolvedMinutes);
+      await attemptSchedule(capture.id, preferredSlot ?? undefined);
+    } catch (error: any) {
+      Alert.alert('Save failed', error?.message ?? 'Could not save capture.');
+    } finally {
+      setSubmitting(false);
+    }
+  }, [attemptSchedule, finalizeCapture, followUpAnswer, followUpState, pendingCapture, timezone]);
 
   const handleAddCapture = useCallback(async () => {
     if (!userId) {
@@ -194,33 +533,96 @@ export default function HomeTab() {
       return;
     }
 
-    const parsedMinutes = minutesInput ? Number(minutesInput) : undefined;
-    if (minutesInput && (Number.isNaN(parsedMinutes) || parsedMinutes <= 0)) {
-      Alert.alert('Check duration', 'Estimated minutes should be a positive number.');
-      return;
+    const trimmedMinutes = minutesInput.trim();
+    const hasMinutes = trimmedMinutes.length > 0;
+    let resolvedMinutes: number | null = null;
+    if (hasMinutes) {
+      resolvedMinutes = Number(trimmedMinutes);
+      if (Number.isNaN(resolvedMinutes) || resolvedMinutes <= 0) {
+        Alert.alert('Check duration', 'Estimated minutes should be a positive number.');
+        return;
+      }
     }
 
     try {
       setSubmitting(true);
-      await addCapture(
-        {
-          content,
-          estimatedMinutes: parsedMinutes,
-          importance,
-        },
-        userId,
-      );
-      setIdea('');
-      setMinutesInput('');
-      setImportance(2);
-      const updatedPending = await loadPending();
-      await scheduleTopCapture(updatedPending[0]?.id);
+      setPendingCapture(null);
+      setFollowUpState(null);
+      setFollowUpAnswer('');
+
+      const mode = await getAssistantModePreference();
+      let preferredBase: { start?: string | null; end?: string | null } | null = null;
+      let parseResult: ParseTaskResponse | null = null;
+
+      try {
+        const parseMode: ParseMode = hasMinutes ? 'deterministic' : mode;
+        parseResult = await parseCapture({
+          text: content,
+          mode: parseMode,
+          timezone,
+          now: new Date().toISOString(),
+        });
+        preferredBase = extractPreferredFromParse(parseResult);
+      } catch (error) {
+        if (!hasMinutes) {
+          const message =
+            error instanceof Error ? error.message : 'We could not infer the duration automatically.';
+          Alert.alert(
+            'Need a duration',
+            `${message}\n\nPlease enter an estimated number of minutes so DiaGuru can schedule this.`,
+          );
+          setSubmitting(false);
+          return;
+        }
+      }
+
+      if (!hasMinutes) {
+        const candidate = parseResult?.structured?.estimated_minutes;
+        if (typeof candidate === 'number' && candidate > 0) {
+          resolvedMinutes = candidate;
+        } else if (mode === 'conversational' && parseResult?.follow_up) {
+          setPendingCapture({
+            baseContent: content,
+            importance,
+            appended: [],
+            preferredStart: preferredBase?.start ?? null,
+            preferredEnd: preferredBase?.end ?? null,
+            mode,
+          });
+          setFollowUpState({
+            prompt: parseResult.follow_up.prompt,
+            missing: parseResult.follow_up.missing ?? [],
+          });
+          setFollowUpAnswer('');
+          setSubmitting(false);
+          return;
+        } else {
+          const prompt =
+            parseResult?.follow_up?.prompt ?? 'About how many minutes do you expect this to take?';
+          Alert.alert('Need a duration', prompt);
+          setSubmitting(false);
+          return;
+        }
+      }
+
+      if (resolvedMinutes === null) {
+        Alert.alert(
+          'Need a duration',
+          'Please enter an estimated number of minutes so DiaGuru can schedule this.',
+        );
+        setSubmitting(false);
+        return;
+      }
+
+      const created = await finalizeCapture(content, resolvedMinutes, importance);
+      const preferredSlot = computePreferredSlot(preferredBase, resolvedMinutes);
+      await attemptSchedule(created.id, preferredSlot ?? undefined);
     } catch (error: any) {
       Alert.alert('Save failed', error?.message ?? 'Could not save capture.');
     } finally {
       setSubmitting(false);
     }
-  }, [idea, importance, loadPending, minutesInput, scheduleTopCapture, userId]);
+  }, [attemptSchedule, finalizeCapture, idea, importance, minutesInput, timezone, userId]);
 
   const overdueScheduled = useMemo(
     () =>
@@ -244,6 +646,12 @@ export default function HomeTab() {
     [scheduled],
   );
 
+  const pendingPreview = useMemo(() => pending.slice(0, 3), [pending]);
+  const queueExtras = Math.max(0, pending.length - pendingPreview.length);
+  const overduePreview = useMemo(() => overdueScheduled.slice(0, 2), [overdueScheduled]);
+  const upcomingPreview = useMemo(() => upcomingScheduled.slice(0, 3), [upcomingScheduled]);
+  const followUpVisible = Boolean(followUpState);
+
   const handleCompletionAction = useCallback(
     async (capture: Capture, action: CaptureStatus | 'reschedule') => {
       if (!userId) return;
@@ -254,14 +662,14 @@ export default function HomeTab() {
         } else if (action === 'reschedule') {
           await invokeCaptureCompletion(capture.id, 'reschedule');
         }
-        await Promise.all([loadPending(), loadScheduled(), loadEvents(false)]);
+        await Promise.all([loadPending(), loadScheduled()]);
       } catch (error: any) {
         Alert.alert('Action failed', error?.message ?? 'Unable to update scheduled item.');
       } finally {
         setActionCaptureId(null);
       }
     },
-    [loadEvents, loadPending, loadScheduled, userId],
+    [loadPending, loadScheduled, userId],
   );
 
   const captureForm = (
@@ -356,9 +764,12 @@ export default function HomeTab() {
               </Text>
             </TouchableOpacity>
           </View>
-          {pending.map((capture) => (
-            <CaptureCard key={capture.id} capture={capture} />
+          {pendingPreview.map((capture, index) => (
+            <CaptureCard key={capture.id} capture={capture} rank={index + 1} />
           ))}
+          {queueExtras > 0 ? (
+            <Text style={styles.sectionSubtext}>{`+${queueExtras} more waiting in the queue`}</Text>
+          ) : null}
         </View>
       )}
     </View>
@@ -368,8 +779,8 @@ export default function HomeTab() {
     <View style={styles.captureSection}>
       <Text style={styles.sectionTitle}>Scheduled by DiaGuru</Text>
       <Text style={styles.sectionSubtext}>
-        DiaGuru keeps 30 minute buffers and won&apos;t book anything past 10pm. Confirm items once
-        you finish so the system keeps learning.
+        DiaGuru keeps 30 minute buffers and won&apos;t book anything past 10pm. Confirm items once you
+        finish so the system keeps learning.
       </Text>
 
       {scheduledLoading ? (
@@ -383,7 +794,7 @@ export default function HomeTab() {
           {overdueScheduled.length > 0 && (
             <View style={{ gap: 12 }}>
               <Text style={styles.sectionSubtitle}>Needs check-in</Text>
-              {overdueScheduled.map((capture) => (
+              {overduePreview.map((capture) => (
                 <ScheduledCard
                   key={capture.id}
                   capture={capture}
@@ -392,15 +803,21 @@ export default function HomeTab() {
                   onReschedule={() => handleCompletionAction(capture, 'reschedule')}
                 />
               ))}
+              {overdueScheduled.length > overduePreview.length ? (
+                <Text style={styles.sectionSubtext}>{`+${overdueScheduled.length - overduePreview.length} more awaiting confirmation`}</Text>
+              ) : null}
             </View>
           )}
 
           {upcomingScheduled.length > 0 && (
-            <View style={{ gap: 12, marginTop: overdueScheduled.length > 0 ? 16 : 0 }}>
+            <View style={{ gap: 12 }}>
               <Text style={styles.sectionSubtitle}>Upcoming</Text>
-              {upcomingScheduled.map((capture) => (
+              {upcomingPreview.map((capture) => (
                 <ScheduledSummaryCard key={capture.id} capture={capture} />
               ))}
+              {upcomingScheduled.length > upcomingPreview.length ? (
+                <Text style={styles.sectionSubtext}>{`+${upcomingScheduled.length - upcomingPreview.length} more scheduled`}</Text>
+              ) : null}
             </View>
           )}
         </>
@@ -408,43 +825,77 @@ export default function HomeTab() {
     </View>
   );
 
-  const eventsContent = useMemo(() => {
-    if (eventsLoading) return <ActivityIndicator />;
-    if (eventsError) return <Text style={styles.errorText}>{eventsError}</Text>;
-    if (events.length === 0) {
-      return <Text style={styles.sectionSubtext}>Nothing scheduled over the next seven days.</Text>;
-    }
-
-    return events.map((event) => <EventRow key={event.id} e={event} />);
-  }, [events, eventsError, eventsLoading]);
-
   return (
-    <ScrollView
-      style={{ flex: 1 }}
-      contentContainerStyle={{ padding: 16, gap: 24 }}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-    >
-      {captureForm}
-      {scheduledSection}
+    <>
+      <SafeAreaView style={[styles.safeArea, { paddingTop: Math.max(insets.top, 16) }]}>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.scrollContent}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        >
+          {captureForm}
+          {scheduledSection}
+        </ScrollView>
+      </SafeAreaView>
 
-      <View style={styles.captureSection}>
-        <Text style={styles.sectionTitle}>Upcoming calendar</Text>
-        <Text style={styles.sectionSubtext}>
-          DiaGuru tags its sessions with [DG]. External events stay untouched so your original plans remain.
-        </Text>
-        <View style={{ marginTop: 12, gap: 12 }}>{eventsContent}</View>
-      </View>
-    </ScrollView>
+      <Modal
+        visible={followUpVisible}
+        animationType="fade"
+        transparent
+        onRequestClose={handleFollowUpCancel}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.followUpBackdrop}
+        >
+          <View style={styles.followUpCard}>
+            <Text style={styles.followUpTitle}>Need a detail</Text>
+            <Text style={styles.followUpPrompt}>{followUpState?.prompt ?? 'Could you share the missing detail?'}</Text>
+            {followUpState?.missing?.length ? (
+              <Text style={styles.followUpHint}>Missing: {followUpState.missing.join(', ')}</Text>
+            ) : null}
+            <TextInput
+              style={styles.followUpInput}
+              value={followUpAnswer}
+              onChangeText={setFollowUpAnswer}
+              placeholder="It should take about 45 minutes..."
+              placeholderTextColor="#9CA3AF"
+              autoFocus
+              editable={!submitting}
+            />
+            <View style={styles.followUpActions}>
+              <TouchableOpacity
+                onPress={handleFollowUpCancel}
+                style={styles.tertiaryButton}
+                disabled={submitting}
+              >
+                <Text style={styles.tertiaryButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleFollowUpSubmit}
+                style={[styles.confirmButton, submitting && styles.confirmButtonDisabled]}
+                disabled={submitting}
+              >
+                <Text style={styles.confirmButtonText}>{submitting ? 'Saving...' : 'Send'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </>
   );
 }
 
-function CaptureCard({ capture }: { capture: Capture }) {
+function CaptureCard({ capture, rank }: { capture: Capture; rank: number }) {
   return (
     <View style={styles.captureCard}>
-      <Text style={styles.captureTitle}>{capture.content}</Text>
+      <View style={styles.captureCardHeader}>
+        <Text style={styles.captureRank}>{`#${rank}`}</Text>
+        <Text style={[styles.captureTitle, styles.captureTitleFlex]}>{capture.content}</Text>
+      </View>
       <Text style={styles.captureMeta}>
-        {`Importance: ${IMPORTANCE_LEVELS.find((it) => it.value === capture.importance)?.label ?? 'Medium'}`}
-        {capture.estimated_minutes ? ` · ~${capture.estimated_minutes} min` : ''}
+        {'Importance: ' + (IMPORTANCE_LEVELS.find((it) => it.value === capture.importance)?.label ?? 'Medium')}
+        {capture.estimated_minutes ? ' · ~' + capture.estimated_minutes + ' min' : ''}
       </Text>
     </View>
   );
@@ -469,7 +920,7 @@ function ScheduledCard({
       <Text style={styles.captureTitle}>{capture.content}</Text>
       <Text style={styles.captureMeta}>
         {start ? start.toLocaleString() : 'Scheduled time unavailable'}
-        {end ? ` – ${end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
+        {end ? ` -> ${end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
       </Text>
       <View style={styles.captureActions}>
         <TouchableOpacity
@@ -506,29 +957,16 @@ function ScheduledSummaryCard({ capture }: { capture: Capture }) {
       <Text style={styles.captureTitle}>{capture.content}</Text>
       <Text style={styles.captureMeta}>
         {start ? start.toLocaleString() : 'Scheduled time unavailable'}
-        {end ? ` – ${end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
+        {end ? ` -> ${end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
       </Text>
     </View>
   );
 }
 
-function EventRow({ e }: { e: SimpleEvent }) {
-  const start = e.start?.dateTime ?? e.start?.date;
-  const end = e.end?.dateTime ?? e.end?.date;
-  const isDiaGuru =
-    e.extendedProperties?.private?.diaGuru === 'true' ||
-    (e.summary ?? '').trim().startsWith('[DG]');
-
-  return (
-    <TouchableOpacity onPress={() => e.htmlLink && Linking.openURL(e.htmlLink)} style={styles.card}>
-      <Text style={[styles.title, isDiaGuru && styles.diaGuruTitle]}>{e.summary ?? '(no title)'}</Text>
-      <Text style={styles.time}>{`${start} -> ${end}`}</Text>
-      {isDiaGuru && <Text style={styles.diaGuruTag}>DiaGuru scheduled</Text>}
-    </TouchableOpacity>
-  );
-}
-
 const styles = StyleSheet.create({
+  safeArea: { flex: 1, backgroundColor: '#F3F4F6' },
+  scroll: { flex: 1 },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 32, gap: 24 },
   captureSection: {
     backgroundColor: '#fff',
     borderRadius: 12,
@@ -580,13 +1018,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  primaryButtonDisabled: {
-    opacity: 0.6,
-  },
-  primaryButtonText: {
-    color: '#fff',
-    fontWeight: '700',
-  },
+  primaryButtonDisabled: { opacity: 0.6 },
+  primaryButtonText: { color: '#fff', fontWeight: '700' },
   secondaryButton: {
     borderRadius: 10,
     paddingVertical: 10,
@@ -595,16 +1028,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2563EB',
   },
-  secondaryButtonText: {
-    color: '#2563EB',
-    fontWeight: '700',
-  },
+  secondaryButtonText: { color: '#2563EB', fontWeight: '700' },
   secondaryButtonTextDisabled: { color: '#9CA3AF' },
-  captureListHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
+  captureListHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   captureCard: {
     borderWidth: 1,
     borderColor: '#E5E7EB',
@@ -612,7 +1038,10 @@ const styles = StyleSheet.create({
     padding: 14,
     gap: 6,
   },
+  captureCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  captureRank: { fontSize: 14, fontWeight: '700', color: '#2563EB' },
   captureTitle: { fontSize: 16, fontWeight: '600', color: '#111827' },
+  captureTitleFlex: { flex: 1 },
   captureMeta: { color: '#6B7280' },
   captureActions: { flexDirection: 'row', gap: 12, marginTop: 12 },
   card: {
@@ -626,7 +1055,56 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 16, fontWeight: '600', marginBottom: 4, color: '#111' },
   time: { color: '#555' },
-  diaGuruTitle: { color: '#2563EB' },
-  diaGuruTag: { color: '#2563EB', fontSize: 12, fontWeight: '600' },
   errorText: { color: '#DC2626' },
+  followUpBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(17, 24, 39, 0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  followUpCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 20,
+    gap: 12,
+  },
+  followUpTitle: { fontSize: 18, fontWeight: '600', color: '#111827' },
+  followUpPrompt: { color: '#374151' },
+  followUpHint: { color: '#6B7280', fontSize: 12 },
+  followUpInput: {
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    color: '#111827',
+    backgroundColor: '#F9FAFB',
+  },
+  followUpActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 12 },
+  tertiaryButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    backgroundColor: '#fff',
+  },
+  tertiaryButtonText: { color: '#111827', fontWeight: '600' },
+  confirmButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#2563EB',
+  },
+  confirmButtonDisabled: { opacity: 0.6 },
+  confirmButtonText: { color: '#fff', fontWeight: '700' },
 });
+
+
+
+
+
+

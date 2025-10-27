@@ -1,4 +1,4 @@
-import { assertEquals, assertStrictEquals } from "https://deno.land/std@0.208.0/assert/mod.ts";
+import { assertEquals, assertStrictEquals } from "std/assert";
 import { extractGoogleError, parseEventDate } from "./index.ts";
 
 Deno.test("extractGoogleError returns nested message", () => {

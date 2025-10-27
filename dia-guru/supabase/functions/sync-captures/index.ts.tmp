@@ -1,6 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
@@ -9,8 +8,22 @@ type CalendarEvent = {
   id: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
-  summary?: string;
   extendedProperties?: { private?: Record<string, string> | null } | null;
+};
+
+type CaptureRow = {
+  id: string;
+  user_id: string;
+  status: string;
+  planned_start: string | null;
+  planned_end: string | null;
+  calendar_event_id: string | null;
+};
+
+type CalendarTokenRow = {
+  access_token: string;
+  refresh_token: string | null;
+  expiry: string | null;
 };
 
 class SyncError extends Error {
@@ -34,14 +47,16 @@ export async function handler(req: Request) {
     const clientId = Deno.env.get("GOOGLE_CLIENT_ID")!;
     const clientSecret = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
 
-    const supaFromUser = createClient<Database, "public">(supabaseUrl, anon, {
+    // deno-lint-ignore no-explicit-any
+    const supaFromUser = createClient<any>(supabaseUrl, anon, {
       global: { headers: { Authorization: auth } },
     });
     const { data: userData, error: userError } = await supaFromUser.auth.getUser();
     if (userError || !userData?.user) throw new SyncError("Unauthorized", 401, userError);
 
     const userId = userData.user.id;
-    const admin = createClient<Database, "public">(supabaseUrl, serviceRole);
+    // deno-lint-ignore no-explicit-any
+    const admin = createClient<any>(supabaseUrl, serviceRole);
 
     const { data: account, error: accountError } = await admin
       .from("calendar_accounts")
@@ -77,10 +92,10 @@ export async function handler(req: Request) {
           .select("id, user_id, status, planned_start, planned_end, calendar_event_id")
           .eq("user_id", userId)
           .in("id", captureIds)
-      : { data: [] as CaptureEntryRow[] };
+      : { data: [] as CaptureRow[] };
 
-    const capturesById = new Map<string, CaptureEntryRow>();
-    for (const row of (captureRows ?? []) as CaptureEntryRow[]) {
+    const capturesById = new Map<string, CaptureRow>();
+    for (const row of (captureRows ?? []) as CaptureRow[]) {
       capturesById.set(row.id, row);
     }
 
@@ -90,7 +105,7 @@ export async function handler(req: Request) {
       .eq("user_id", userId)
       .eq("status", "scheduled");
 
-    const scheduledCaptures = (scheduledRows ?? []) as CaptureEntryRow[];
+    const scheduledCaptures = (scheduledRows ?? []) as CaptureRow[];
 
     const scheduledUpdates: {
       id: string;
@@ -192,8 +207,9 @@ if (import.meta.main) {
   Deno.serve(handler);
 }
 
+// deno-lint-ignore no-explicit-any
 async function resolveAccessToken(
-  admin: SupabaseClient<Database, "public">,
+  admin: SupabaseClient<any>,
   accountId: number,
   clientId: string,
   clientSecret: string,
@@ -229,17 +245,13 @@ async function resolveAccessToken(
     const payload = await safeParse(res);
     if (!res.ok) throw new SyncError("Failed to refresh Google token", res.status, payload);
 
-    const tokenData = (payload ?? {}) as Record<string, unknown>;
-    accessToken = String(tokenData.access_token ?? accessToken);
-    const expiresInValue = tokenData.expires_in;
-    const expiresIn =
-      typeof expiresInValue === "number" ? expiresInValue : Number(expiresInValue ?? 0);
+    accessToken = (payload as any).access_token;
+    const expiresIn = (payload as any).expires_in ?? 0;
     const newExpiry = new Date(Date.now() + expiresIn * 1000).toISOString();
     await admin.from("calendar_tokens").upsert({
       account_id: accountId,
       access_token: accessToken,
-      refresh_token:
-        typeof tokenData.refresh_token === "string" ? tokenData.refresh_token : refreshToken,
+      refresh_token: (payload as any).refresh_token ?? refreshToken,
       expiry: newExpiry,
     });
     refreshed = true;
