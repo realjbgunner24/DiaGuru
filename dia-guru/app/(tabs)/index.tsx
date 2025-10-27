@@ -1,6 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSupabaseSession } from '@/hooks/useSupabaseSession';
-import { fetchUpcomingEvents, SimpleEvent } from '@/lib/calendar';
 import {
   addCapture,
   Capture,
@@ -26,7 +25,6 @@ import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
-  Linking,
   Modal,
   Platform,
   RefreshControl,
@@ -179,9 +177,6 @@ export default function HomeTab() {
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [scheduledError, setScheduledError] = useState<string | null>(null);
 
-  const [events, setEvents] = useState<SimpleEvent[]>([]);
-  const [eventsLoading, setEventsLoading] = useState(true);
-  const [eventsError, setEventsError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const [scheduling, setScheduling] = useState(false);
@@ -277,24 +272,6 @@ export default function HomeTab() {
     ensureReminders();
   }, [ensureReminders, reminderLoaded]);
 
-  const loadEvents = useCallback(
-    async (showSpinner: boolean) => {
-      if (showSpinner) setEventsLoading(true);
-      setEventsError(null);
-      try {
-        const list = await fetchUpcomingEvents(7);
-        setEvents(list);
-      } catch (error: any) {
-        setEventsError(error?.message ?? 'Failed to load calendar events');
-      } finally {
-        if (showSpinner) {
-          setEventsLoading(false);
-        }
-      }
-    },
-    [],
-  );
-
   const loadPending = useCallback(async () => {
     if (!userId) return [];
     setPendingLoading(true);
@@ -349,13 +326,13 @@ export default function HomeTab() {
     setRefreshing(true);
     try {
       await synchronizeFromCalendar();
-      await Promise.all([loadEvents(false), loadPending(), loadScheduled()]);
+      await Promise.all([loadPending(), loadScheduled()]);
     } catch (error) {
       console.log('refresh sync error', error);
     } finally {
       setRefreshing(false);
     }
-  }, [loadEvents, loadPending, loadScheduled, synchronizeFromCalendar, userId]);
+  }, [loadPending, loadScheduled, synchronizeFromCalendar, userId]);
 
   const scheduleTopCapture = useCallback(
     async (
@@ -375,7 +352,7 @@ export default function HomeTab() {
           timezoneOffsetMinutes,
           ...(options ?? {}),
         });
-        await Promise.all([loadPending(), loadScheduled(), loadEvents(false)]);
+        await Promise.all([loadPending(), loadScheduled()]);
         return response;
       } catch (error) {
         console.log('schedule-capture error', error);
@@ -386,7 +363,7 @@ export default function HomeTab() {
         autoSchedulingRef.current = false;
       }
     },
-    [loadEvents, loadPending, loadScheduled, pending, timezone, timezoneOffsetMinutes, userId],
+    [loadPending, loadScheduled, pending, timezone, timezoneOffsetMinutes, userId],
   );
 
   const finalizeCapture = useCallback(
@@ -673,7 +650,6 @@ export default function HomeTab() {
   const queueExtras = Math.max(0, pending.length - pendingPreview.length);
   const overduePreview = useMemo(() => overdueScheduled.slice(0, 2), [overdueScheduled]);
   const upcomingPreview = useMemo(() => upcomingScheduled.slice(0, 3), [upcomingScheduled]);
-  const eventsPreview = useMemo(() => events.slice(0, 5), [events]);
   const followUpVisible = Boolean(followUpState);
 
   const handleCompletionAction = useCallback(
@@ -686,14 +662,14 @@ export default function HomeTab() {
         } else if (action === 'reschedule') {
           await invokeCaptureCompletion(capture.id, 'reschedule');
         }
-        await Promise.all([loadPending(), loadScheduled(), loadEvents(false)]);
+        await Promise.all([loadPending(), loadScheduled()]);
       } catch (error: any) {
         Alert.alert('Action failed', error?.message ?? 'Unable to update scheduled item.');
       } finally {
         setActionCaptureId(null);
       }
     },
-    [loadEvents, loadPending, loadScheduled, userId],
+    [loadPending, loadScheduled, userId],
   );
 
   const captureForm = (
@@ -803,8 +779,8 @@ export default function HomeTab() {
     <View style={styles.captureSection}>
       <Text style={styles.sectionTitle}>Scheduled by DiaGuru</Text>
       <Text style={styles.sectionSubtext}>
-        DiaGuru keeps 30 minute buffers and won&apos;t book anything past 10pm. Confirm items once
-        you finish so the system keeps learning.
+        DiaGuru keeps 30 minute buffers and won&apos;t book anything past 10pm. Confirm items once you
+        finish so the system keeps learning.
       </Text>
 
       {scheduledLoading ? (
@@ -849,25 +825,6 @@ export default function HomeTab() {
     </View>
   );
 
-  const eventsContent = useMemo(() => {
-    if (eventsLoading) return <ActivityIndicator />;
-    if (eventsError) return <Text style={styles.errorText}>{eventsError}</Text>;
-    if (eventsPreview.length === 0) {
-      return <Text style={styles.sectionSubtext}>Nothing scheduled over the next seven days.</Text>;
-    }
-
-    return (
-      <>
-        {eventsPreview.map((event) => (
-          <EventRow key={event.id} e={event} />
-        ))}
-        {events.length > eventsPreview.length ? (
-          <Text style={styles.sectionSubtext}>{`+${events.length - eventsPreview.length} more events synced from Google`}</Text>
-        ) : null}
-      </>
-    );
-  }, [events, eventsError, eventsLoading, eventsPreview]);
-
   return (
     <>
       <SafeAreaView style={[styles.safeArea, { paddingTop: Math.max(insets.top, 16) }]}>
@@ -878,14 +835,6 @@ export default function HomeTab() {
         >
           {captureForm}
           {scheduledSection}
-
-          <View style={styles.captureSection}>
-            <Text style={styles.sectionTitle}>Upcoming calendar</Text>
-            <Text style={styles.sectionSubtext}>
-              DiaGuru tags its sessions with [DG]. External events stay untouched so your original plans remain.
-            </Text>
-            <View style={{ marginTop: 12, gap: 12 }}>{eventsContent}</View>
-          </View>
         </ScrollView>
       </SafeAreaView>
 
@@ -1014,22 +963,6 @@ function ScheduledSummaryCard({ capture }: { capture: Capture }) {
   );
 }
 
-function EventRow({ e }: { e: SimpleEvent }) {
-  const start = e.start?.dateTime ?? e.start?.date;
-  const end = e.end?.dateTime ?? e.end?.date;
-  const isDiaGuru =
-    e.extendedProperties?.private?.diaGuru === 'true' ||
-    (e.summary ?? '').trim().startsWith('[DG]');
-
-  return (
-    <TouchableOpacity onPress={() => e.htmlLink && Linking.openURL(e.htmlLink)} style={styles.card}>
-      <Text style={[styles.title, isDiaGuru && styles.diaGuruTitle]}>{e.summary ?? '(no title)'}</Text>
-      <Text style={styles.time}>{`${start} -> ${end}`}</Text>
-      {isDiaGuru && <Text style={styles.diaGuruTag}>DiaGuru scheduled</Text>}
-    </TouchableOpacity>
-  );
-}
-
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#F3F4F6' },
   scroll: { flex: 1 },
@@ -1122,8 +1055,6 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 16, fontWeight: '600', marginBottom: 4, color: '#111' },
   time: { color: '#555' },
-  diaGuruTitle: { color: '#2563EB' },
-  diaGuruTag: { color: '#2563EB', fontSize: 12, fontWeight: '600' },
   errorText: { color: '#DC2626' },
   followUpBackdrop: {
     flex: 1,
@@ -1171,3 +1102,9 @@ const styles = StyleSheet.create({
   confirmButtonDisabled: { opacity: 0.6 },
   confirmButtonText: { color: '#fff', fontWeight: '700' },
 });
+
+
+
+
+
+
