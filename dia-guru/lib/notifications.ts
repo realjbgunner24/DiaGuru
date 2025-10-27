@@ -34,3 +34,25 @@ export async function scheduleIn(seconds: number, title: string, body: string) {
     content: { title, body }, trigger: { type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL, seconds },
   });
 }
+
+export async function scheduleReminderAt(date: Date, title: string, body: string) {
+  await ensureAndroidChannel();
+  const trigger: Notifications.DateTriggerInput | null = date.getTime() <= Date.now()
+    ? null
+    : { type: Notifications.SchedulableTriggerInputTypes.DATE, date };
+  return Notifications.scheduleNotificationAsync({
+    content: { title, body },
+    trigger,
+  });
+}
+
+export async function cancelScheduledNotification(id: string) {
+  if (!id) return;
+  try {
+    await Notifications.cancelScheduledNotificationAsync(id);
+  } catch (error) {
+    console.log('cancel notification failed', error);
+  }
+}
+
+

@@ -36,6 +36,10 @@ export async function handler(req: Request) {
     const body = await req.json().catch(() => ({}));
     const captureId = body.captureId as string | undefined;
     const action = (body.action as "schedule" | "reschedule" | "complete") ?? "schedule";
+    const timezoneOffsetMinutes =
+      typeof body.timezoneOffsetMinutes === "number" && Number.isFinite(body.timezoneOffsetMinutes)
+        ? body.timezoneOffsetMinutes
+        : null;
 
     if (!captureId) return json({ error: "captureId required" }, 400);
 
@@ -108,7 +112,7 @@ export async function handler(req: Request) {
     }
 
     const durationMinutes = Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
-    const candidate = await findNextAvailableSlot(accessToken, durationMinutes);
+    const candidate = await findNextAvailableSlot(accessToken, durationMinutes, timezoneOffsetMinutes);
     if (!candidate) {
       return json({ error: "No available slot within the next week." }, 409);
     }
@@ -223,7 +227,14 @@ async function refreshGoogleToken(refreshToken: string, clientId: string, client
   return await res.json();
 }
 
-async function findNextAvailableSlot(accessToken: string, durationMinutes: number) {
+async function findNextAvailableSlot(
+  accessToken: string,
+  durationMinutes: number,
+  timezoneOffsetMinutes: number | null,
+) {
+  const offset = typeof timezoneOffsetMinutes === "number" && Number.isFinite(timezoneOffsetMinutes)
+    ? timezoneOffsetMinutes
+    : 0;
   const now = new Date();
   const timeMin = now.toISOString();
   const timeMax = new Date(now.getTime() + SEARCH_DAYS * 86400000).toISOString();
@@ -238,20 +249,23 @@ async function findNextAvailableSlot(accessToken: string, durationMinutes: numbe
         start: addMinutes(start, -BUFFER_MINUTES),
         end: addMinutes(end, BUFFER_MINUTES),
       };
-    })
-    .filter(Boolean) as { start: Date; end: Date }[];
+  })
+  .filter(Boolean) as { start: Date; end: Date }[];
 
   intervals.sort((a, b) => a.start.getTime() - b.start.getTime());
 
-  let cursor = new Date(now.getTime());
-  cursor.setMinutes(cursor.getMinutes() + 5);
+  let cursor = addMinutes(now, 5);
+  if (isBeforeDayStart(cursor, offset)) {
+    cursor = startOfDayOffset(now, offset);
+  }
 
   for (let day = 0; day < SEARCH_DAYS; day++) {
-    const dayStart = startOfDay(addDays(now, day));
+    const dayStart = startOfDayOffset(addDays(now, day), offset);
     let candidateStart = new Date(Math.max(dayStart.getTime(), cursor.getTime()));
-    while (candidateStart.getHours() < DAY_END_HOUR) {
+    while (true) {
+      if (isAfterDayEnd(candidateStart, offset)) break;
       const candidateEnd = addMinutes(candidateStart, durationMinutes);
-      if (candidateEnd.getHours() >= DAY_END_HOUR && candidateEnd.getMinutes() > 0) break;
+      if (isAfterDayEnd(candidateEnd, offset)) break;
 
       if (isSlotFree(candidateStart, candidateEnd, intervals)) {
         return { start: candidateStart, end: candidateEnd };
@@ -259,7 +273,7 @@ async function findNextAvailableSlot(accessToken: string, durationMinutes: numbe
 
       candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
     }
-    cursor = startOfDay(addDays(now, day + 1));
+    cursor = startOfDayOffset(addDays(now, day + 1), offset);
   }
 
   return null;
@@ -355,10 +369,32 @@ function addDays(date: Date, days: number) {
   return next;
 }
 
-function startOfDay(date: Date) {
-  const start = new Date(date.getTime());
+function startOfDayOffset(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  local.setHours(8, 0, 0, 0);
+  return toUtcDate(local, offsetMinutes);
+}
+
+function isBeforeDayStart(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  const start = new Date(local.getTime());
   start.setHours(8, 0, 0, 0);
-  return start;
+  return local.getTime() < start.getTime();
+}
+
+function isAfterDayEnd(date: Date, offsetMinutes: number) {
+  const local = toLocalDate(date, offsetMinutes);
+  if (local.getHours() > DAY_END_HOUR) return true;
+  if (local.getHours() === DAY_END_HOUR && local.getMinutes() > 0) return true;
+  return false;
+}
+
+function toLocalDate(date: Date, offsetMinutes: number) {
+  return new Date(date.getTime() + offsetMinutes * 60000);
+}
+
+function toUtcDate(date: Date, offsetMinutes: number) {
+  return new Date(date.getTime() - offsetMinutes * 60000);
 }
 
 function isSlotFree(start: Date, end: Date, intervals: { start: Date; end: Date }[]) {
