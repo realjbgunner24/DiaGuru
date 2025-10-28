@@ -584,11 +584,9 @@ function computeSchedulingPlan(
   if (constraintType === "deadline_time" || constraintType === "deadline_date") {
     const deadline = resolveDeadlineFromCapture(capture, offsetMinutes);
     if (deadline) {
-      const start = new Date(Math.max(deadline.getTime() - durationMs, referenceNow.getTime()));
-      const end = new Date(start.getTime() + durationMs);
       return {
         mode: "deadline",
-        preferredSlot: { start, end },
+        preferredSlot: null,
         deadline,
         window: null,
       };
@@ -678,22 +676,33 @@ function findSlotBeforeDeadline(
   options: { deadline: Date; referenceNow: Date },
 ): PreferredSlot | null {
   const durationMs = durationMinutes * 60000;
-  let currentEnd = new Date(options.deadline.getTime());
+  const latestStart = new Date(options.deadline.getTime() - durationMs);
+  if (latestStart.getTime() < options.referenceNow.getTime()) return null;
 
-  for (let day = 0; day < SEARCH_DAYS; day++) {
-    let candidateEnd = new Date(currentEnd.getTime());
-    while (candidateEnd.getTime() - durationMs >= options.referenceNow.getTime()) {
-      const candidateStart = new Date(candidateEnd.getTime() - durationMs);
-      if (isBeforeDayStart(candidateStart, offsetMinutes)) break;
-      if (!isAfterDayEnd(candidateEnd, offsetMinutes) && isSlotFree(candidateStart, candidateEnd, intervals)) {
-        return { start: candidateStart, end: candidateEnd };
-      }
-      candidateEnd = addMinutes(candidateEnd, -SLOT_INCREMENT_MINUTES);
+  let candidateStart = new Date(Math.max(options.referenceNow.getTime(), Date.now()));
+  if (isBeforeDayStart(candidateStart, offsetMinutes)) {
+    candidateStart = startOfDayOffset(candidateStart, offsetMinutes);
+  }
+  if (isAfterDayEnd(candidateStart, offsetMinutes)) {
+    candidateStart = startOfDayOffset(addDays(candidateStart, 1), offsetMinutes);
+  }
+
+  while (candidateStart.getTime() <= latestStart.getTime()) {
+    const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+    if (candidateEnd.getTime() > options.deadline.getTime()) break;
+
+    if (
+      !isBeforeDayStart(candidateStart, offsetMinutes) &&
+      !isAfterDayEnd(candidateEnd, offsetMinutes) &&
+      isSlotFree(candidateStart, candidateEnd, intervals)
+    ) {
+      return { start: candidateStart, end: candidateEnd };
     }
-    const previousDay = addDays(currentEnd, -1);
-    const local = toLocalDate(previousDay, offsetMinutes);
-    local.setHours(DAY_END_HOUR, 0, 0, 0);
-    currentEnd = toUtcDate(local, offsetMinutes);
+
+    candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
+    if (isAfterDayEnd(candidateStart, offsetMinutes)) {
+      candidateStart = startOfDayOffset(addDays(candidateStart, 1), offsetMinutes);
+    }
   }
 
   return null;
@@ -756,7 +765,7 @@ function scheduleWithPlan(args: {
   }
 
   if (plan.mode === "start" && plan.preferredSlot) {
-    const toleranceEnd = addMinutes(plan.preferredSlot.start, SLOT_INCREMENT_MINUTES);
+    const toleranceEnd = addMinutes(plan.preferredSlot.start, 60);
     const windowSlot = findSlotWithinWindow(busyIntervals, durationMinutes, offsetMinutes, {
       windowStart: plan.preferredSlot.start,
       windowEnd: toleranceEnd,

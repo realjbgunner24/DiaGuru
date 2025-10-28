@@ -130,7 +130,7 @@ type DerivedConstraint = {
   originalTargetTime: string | null;
 };
 
-const DEADLINE_KEYWORDS = [' due', 'due', 'deadline', 'before', 'submit', 'turn in', 'finish', 'complete'];
+const DEADLINE_KEYWORDS = [' due', 'due', 'deadline', 'before', 'submit', 'turn in', 'finish', 'complete', 'overdue'];
 const START_KEYWORDS = [
   ' start',
   'begin',
@@ -153,6 +153,10 @@ const START_KEYWORDS = [
   'lunch',
   'dinner',
   'breakfast',
+  'nap',
+  'sleep',
+  'rest',
+  'meditate',
 ];
 
 function deriveConstraintData(
@@ -185,6 +189,7 @@ function deriveConstraintData(
     };
   }
   if (window?.start) {
+    if (!window.start) return defaults;
     return {
       constraintType: 'start_time',
       constraintTime: window.start,
@@ -208,8 +213,10 @@ function deriveConstraintData(
     return defaults;
   }
 
-  const isDateOnly = /T00:00/iu.test(datetime);
-  if (hasDeadlineKeyword && !isDateOnly) {
+  const isDateOnly = /T00:00:00/iu.test(datetime);
+  const hasExplicitTime = !isDateOnly;
+
+  if (hasDeadlineKeyword && hasExplicitTime) {
     return {
       constraintType: 'deadline_time',
       constraintTime: datetime,
@@ -232,6 +239,17 @@ function deriveConstraintData(
   }
 
   if (hasStartKeyword && !hasDeadlineKeyword) {
+    if (!hasExplicitTime) {
+      const date = datetime.slice(0, 10);
+      const endOfDay = buildEndOfDayIso(datetime);
+      return {
+        constraintType: 'deadline_date',
+        constraintTime: null,
+        constraintEnd: null,
+        constraintDate: date,
+        originalTargetTime: endOfDay,
+      };
+    }
     return {
       constraintType: 'start_time',
       constraintTime: datetime,
