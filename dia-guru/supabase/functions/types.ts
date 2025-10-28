@@ -10,6 +10,11 @@ export type CaptureEntryRow = {
   planned_end: string | null;
   last_check_in: string | null;
   scheduling_notes?: string | null;
+  constraint_type: string;
+  constraint_time: string | null;
+  constraint_end: string | null;
+  constraint_date: string | null;
+  original_target_time: string | null;
 };
 
 export type CalendarTokenRow = {

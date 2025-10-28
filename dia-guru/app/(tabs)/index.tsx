@@ -4,6 +4,7 @@ import {
   addCapture,
   Capture,
   CaptureStatus,
+  ConstraintType,
   invokeCaptureCompletion,
   invokeScheduleCapture,
   listCaptures,
@@ -49,8 +50,6 @@ type PendingCaptureState = {
   baseContent: string;
   importance: number;
   appended: string[];
-  preferredStart?: string | null;
-  preferredEnd?: string | null;
   mode: ParseMode;
 };
 
@@ -81,47 +80,11 @@ function extractScheduleError(error: unknown) {
   return 'Unable to schedule this item.';
 }
 
-function extractPreferredFromParse(result: ParseTaskResponse | null | undefined) {
-  if (!result) return null;
-  const structured = result.structured ?? {};
-  const window = structured.window;
-  if (window?.start && window?.end) {
-    return { start: window.start, end: window.end };
-  }
-  if (window?.start) {
-    return { start: window.start, end: window.end ?? null };
-  }
-  if (structured.datetime) {
-    return { start: structured.datetime, end: window?.end ?? null };
-  }
-  return null;
-}
-
-function computePreferredSlot(
-  preferred: { start?: string | null; end?: string | null } | null,
-  durationMinutes: number | null,
-) {
-  if (!preferred?.start) return null;
-  const start = new Date(preferred.start);
-  if (Number.isNaN(start.getTime())) return null;
-  let endIso: string | undefined;
-  if (preferred.end) {
-    const parsedEnd = new Date(preferred.end);
-    if (!Number.isNaN(parsedEnd.getTime())) {
-      endIso = parsedEnd.toISOString();
-    }
-  }
-  if (!endIso && durationMinutes && durationMinutes > 0) {
-    endIso = new Date(start.getTime() + durationMinutes * 60000).toISOString();
-  }
-  return {
-    start: start.toISOString(),
-    end: endIso,
-  };
-}
-
 function formatConflictMessage(decision: ScheduleDecision) {
   const lines = [decision.message.trim()];
+  if (decision.advisor?.message) {
+    lines.push('', decision.advisor.message.trim());
+  }
   if (decision.conflicts.length > 0) {
     lines.push('', 'Conflicts:');
     for (const conflict of decision.conflicts) {
@@ -143,7 +106,173 @@ function formatConflictMessage(decision: ScheduleDecision) {
     });
     lines.push('', `Next available slot: ${suggestionStart} -> ${suggestionEnd}`);
   }
+  if (decision.advisor?.slot?.start) {
+    const advisorStart = new Date(decision.advisor.slot.start).toLocaleString();
+    const advisorEnd =
+      decision.advisor.slot.end &&
+      new Date(decision.advisor.slot.end).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    lines.push(
+      '',
+      `Assistant suggestion: ${advisorStart}${advisorEnd ? ` -> ${advisorEnd}` : ''}`,
+    );
+  }
   return lines.join('\n');
+}
+
+type DerivedConstraint = {
+  constraintType: ConstraintType;
+  constraintTime: string | null;
+  constraintEnd: string | null;
+  constraintDate: string | null;
+  originalTargetTime: string | null;
+};
+
+const DEADLINE_KEYWORDS = [' due', 'due', 'deadline', 'before', 'submit', 'turn in', 'finish', 'complete', 'overdue'];
+const START_KEYWORDS = [
+  ' start',
+  'begin',
+  'meeting',
+  'meet ',
+  'meet-up',
+  'meetup',
+  'call',
+  'appointment',
+  'arrive',
+  'leave',
+  'ride',
+  'flight',
+  'depart',
+  'pickup',
+  'pick up',
+  'drop off',
+  'visit',
+  'hangout',
+  'lunch',
+  'dinner',
+  'breakfast',
+  'nap',
+  'sleep',
+  'rest',
+  'meditate',
+];
+
+function deriveConstraintData(
+  content: string,
+  parseResult: ParseTaskResponse | null,
+  _estimatedMinutes: number | null,
+): DerivedConstraint {
+  const defaults: DerivedConstraint = {
+    constraintType: 'flexible',
+    constraintTime: null,
+    constraintEnd: null,
+    constraintDate: null,
+    originalTargetTime: null,
+  };
+  if (!parseResult) return defaults;
+
+  const structured = parseResult.structured ?? {};
+  const lowerContent = content.toLowerCase();
+  const hasDeadlineKeyword = DEADLINE_KEYWORDS.some((keyword) => lowerContent.includes(keyword));
+  const hasStartKeyword = START_KEYWORDS.some((keyword) => lowerContent.includes(keyword));
+
+  const window = structured.window;
+  if (window?.start && window?.end) {
+    return {
+      constraintType: 'window',
+      constraintTime: window.start,
+      constraintEnd: window.end,
+      constraintDate: null,
+      originalTargetTime: window.end ?? window.start ?? null,
+    };
+  }
+  if (window?.start) {
+    if (!window.start) return defaults;
+    return {
+      constraintType: 'start_time',
+      constraintTime: window.start,
+      constraintEnd: null,
+      constraintDate: null,
+      originalTargetTime: window.start,
+    };
+  }
+  if (window?.end) {
+    return {
+      constraintType: 'deadline_time',
+      constraintTime: window.end,
+      constraintEnd: null,
+      constraintDate: null,
+      originalTargetTime: window.end,
+    };
+  }
+
+  const datetime = structured.datetime;
+  if (!datetime) {
+    return defaults;
+  }
+
+  const isDateOnly = /T00:00:00/iu.test(datetime);
+  const hasExplicitTime = !isDateOnly;
+
+  if (hasDeadlineKeyword && hasExplicitTime) {
+    return {
+      constraintType: 'deadline_time',
+      constraintTime: datetime,
+      constraintEnd: null,
+      constraintDate: null,
+      originalTargetTime: datetime,
+    };
+  }
+
+  if ((hasDeadlineKeyword && isDateOnly) || (isDateOnly && !hasStartKeyword)) {
+    const date = datetime.slice(0, 10);
+    const endOfDay = buildEndOfDayIso(datetime);
+    return {
+      constraintType: 'deadline_date',
+      constraintTime: null,
+      constraintEnd: null,
+      constraintDate: date,
+      originalTargetTime: endOfDay,
+    };
+  }
+
+  if (hasStartKeyword && !hasDeadlineKeyword) {
+    if (!hasExplicitTime) {
+      const date = datetime.slice(0, 10);
+      const endOfDay = buildEndOfDayIso(datetime);
+      return {
+        constraintType: 'deadline_date',
+        constraintTime: null,
+        constraintEnd: null,
+        constraintDate: date,
+        originalTargetTime: endOfDay,
+      };
+    }
+    return {
+      constraintType: 'start_time',
+      constraintTime: datetime,
+      constraintEnd: null,
+      constraintDate: null,
+      originalTargetTime: datetime,
+    };
+  }
+
+  return {
+    constraintType: 'deadline_time',
+    constraintTime: datetime,
+    constraintEnd: null,
+    constraintDate: null,
+    originalTargetTime: datetime,
+  };
+}
+
+function buildEndOfDayIso(datetime: string) {
+  const date = new Date(datetime);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(23, 59, 0, 0);
+  return date.toISOString();
 }
 
 export default function HomeTab() {
@@ -367,16 +496,28 @@ export default function HomeTab() {
   );
 
   const finalizeCapture = useCallback(
-    async (content: string, estimatedMinutes: number | null, selectedImportance: number) => {
+    async (
+      content: string,
+      estimatedMinutes: number | null,
+      selectedImportance: number,
+      parseResult: ParseTaskResponse | null,
+    ) => {
       if (!userId) {
         throw new Error('Sign in required');
       }
+
+      const constraint = deriveConstraintData(content, parseResult, estimatedMinutes);
 
       const created = await addCapture(
         {
           content,
           estimatedMinutes,
           importance: selectedImportance,
+          constraintType: constraint.constraintType,
+          constraintTime: constraint.constraintTime,
+          constraintEnd: constraint.constraintEnd,
+          constraintDate: constraint.constraintDate,
+          originalTargetTime: constraint.originalTargetTime,
         },
         userId,
       );
@@ -393,25 +534,17 @@ export default function HomeTab() {
   );
 
   const attemptSchedule = useCallback(
-    async (captureId: string, preferred?: { start: string; end?: string | null }) => {
-      const baseOptions: ScheduleOptions | undefined = preferred
-        ? {
-            preferredStart: preferred.start,
-            ...(preferred.end ? { preferredEnd: preferred.end } : {}),
-          }
-        : undefined;
-
-      const response = await scheduleTopCapture(captureId, 'schedule', baseOptions);
+    async (captureId: string) => {
+      const response = await scheduleTopCapture(captureId, 'schedule');
       const decision = response?.decision;
-      if (decision?.type === 'preferred_conflict' && preferred) {
+      if (decision?.type === 'preferred_conflict') {
         const message = formatConflictMessage(decision);
-        Alert.alert('Time conflict', message, [
+        Alert.alert('Scheduling conflict', message, [
           { text: 'Cancel', style: 'cancel' },
           {
             text: 'Overlap anyway',
             onPress: () =>
               scheduleTopCapture(captureId, 'schedule', {
-                ...(baseOptions ?? {}),
                 allowOverlap: true,
               }),
           },
@@ -447,36 +580,28 @@ export default function HomeTab() {
       setSubmitting(true);
 
       let resolvedMinutes: number | null = null;
-      const preferredBase: { start?: string | null; end?: string | null } = {
-        start: pendingCapture.preferredStart ?? null,
-        end: pendingCapture.preferredEnd ?? null,
-      };
+      let latestParse: ParseTaskResponse | null = null;
 
       try {
-        const parseResult = await parseCapture({
+        latestParse = await parseCapture({
           text: [pendingCapture.baseContent, ...nextAppended].join('\n'),
           mode: pendingCapture.mode,
           timezone,
           now: new Date().toISOString(),
         });
-        const extracted = extractPreferredFromParse(parseResult);
-        if (extracted?.start) preferredBase.start = extracted.start;
-        if (extracted?.end) preferredBase.end = extracted.end;
-        const candidate = parseResult.structured?.estimated_minutes;
+        const candidate = latestParse.structured?.estimated_minutes;
         if (typeof candidate === 'number' && candidate > 0) {
           resolvedMinutes = candidate;
-        } else if (parseResult.follow_up) {
+        } else if (latestParse.follow_up) {
           setPendingCapture({
             baseContent: pendingCapture.baseContent,
             importance: pendingCapture.importance,
             appended: nextAppended,
-            preferredStart: extracted?.start ?? pendingCapture.preferredStart ?? null,
-            preferredEnd: extracted?.end ?? pendingCapture.preferredEnd ?? null,
             mode: pendingCapture.mode,
           });
           setFollowUpState({
-            prompt: parseResult.follow_up.prompt,
-            missing: parseResult.follow_up.missing ?? [],
+            prompt: latestParse.follow_up.prompt,
+            missing: latestParse.follow_up.missing ?? [],
           });
           setFollowUpAnswer('');
           setSubmitting(false);
@@ -506,14 +631,14 @@ export default function HomeTab() {
         pendingCapture.baseContent,
         resolvedMinutes,
         pendingCapture.importance,
+        latestParse,
       );
 
       setFollowUpState(null);
       setFollowUpAnswer('');
       setPendingCapture(null);
 
-      const preferredSlot = computePreferredSlot(preferredBase, resolvedMinutes);
-      await attemptSchedule(capture.id, preferredSlot ?? undefined);
+      await attemptSchedule(capture.id);
     } catch (error: any) {
       Alert.alert('Save failed', error?.message ?? 'Could not save capture.');
     } finally {
@@ -551,7 +676,6 @@ export default function HomeTab() {
       setFollowUpAnswer('');
 
       const mode = await getAssistantModePreference();
-      let preferredBase: { start?: string | null; end?: string | null } | null = null;
       let parseResult: ParseTaskResponse | null = null;
 
       try {
@@ -562,7 +686,6 @@ export default function HomeTab() {
           timezone,
           now: new Date().toISOString(),
         });
-        preferredBase = extractPreferredFromParse(parseResult);
       } catch (error) {
         if (!hasMinutes) {
           const message =
@@ -585,8 +708,6 @@ export default function HomeTab() {
             baseContent: content,
             importance,
             appended: [],
-            preferredStart: preferredBase?.start ?? null,
-            preferredEnd: preferredBase?.end ?? null,
             mode,
           });
           setFollowUpState({
@@ -614,9 +735,8 @@ export default function HomeTab() {
         return;
       }
 
-      const created = await finalizeCapture(content, resolvedMinutes, importance);
-      const preferredSlot = computePreferredSlot(preferredBase, resolvedMinutes);
-      await attemptSchedule(created.id, preferredSlot ?? undefined);
+      const created = await finalizeCapture(content, resolvedMinutes, importance, parseResult);
+      await attemptSchedule(created.id);
     } catch (error: any) {
       Alert.alert('Save failed', error?.message ?? 'Could not save capture.');
     } finally {
