@@ -52,7 +52,7 @@ Deno.serve(async (req) => {
     const admin = createClient(supabaseUrl, serviceRole);
     const { data: acct } = await admin
       .from("calendar_accounts")
-      .upsert({ user_id: user.id, provider: "google" })
+      .upsert({ user_id: user.id, provider: "google", needs_reconnect: false })
       .select("id")
       .single();
 

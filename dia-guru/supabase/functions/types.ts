@@ -24,11 +24,18 @@ export type CalendarTokenRow = {
   expiry: string | null;
 };
 
+export type CalendarAccountRow = {
+  id: number;
+  user_id: string;
+  provider: string;
+  needs_reconnect: boolean;
+};
+
 export type Database = {
   public: {
     Tables: {
       capture_entries: { Row: CaptureEntryRow };
-      calendar_accounts: { Row: { id: number; user_id: string; provider: string } };
+      calendar_accounts: { Row: CalendarAccountRow };
       calendar_tokens: { Row: CalendarTokenRow };
     };
     Functions: Record<string, never>;

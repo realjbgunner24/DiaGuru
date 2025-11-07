@@ -1,6 +1,17 @@
 import { supabase } from '@/lib/supabase';
 import * as Linking from 'expo-linking';
 
+export type CalendarHealth = {
+  status: 'unlinked' | 'healthy' | 'needs_reconnect';
+  linked: boolean;
+  needsReconnect: boolean;
+  hasRefreshToken: boolean;
+  expiresAt: string | null;
+  expiresInSeconds: number | null;
+  refreshed: boolean;
+  checkedAt: string;
+};
+
 export async function connectGoogleCalendar() {
   const {
     data: { session },
@@ -26,4 +37,10 @@ export async function connectGoogleCalendar() {
   });
 
   await Linking.openURL(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+}
+
+export async function getCalendarHealth(): Promise<CalendarHealth> {
+  const { data, error } = await supabase.functions.invoke('calendar-health');
+  if (error) throw error;
+  return data as CalendarHealth;
 }
