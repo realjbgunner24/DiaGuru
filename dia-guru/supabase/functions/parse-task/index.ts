@@ -124,6 +124,16 @@ export async function handler(req: Request) {
     }
 
     const timeCandidate = pickTemporalFromDuckling(ducklingItems);
+    let ambiguousTimeSnippet: string | null = null;
+    if (timeCandidate && timeCandidate.type === "value") {
+      ambiguousTimeSnippet = detectAmbiguousMeridiemSnippet(
+        timeCandidate.source ?? "",
+        content,
+      );
+      if (ambiguousTimeSnippet) {
+        notes.push(`Time "${ambiguousTimeSnippet}" is missing an AM/PM indicator.`);
+      }
+    }
     if (timeCandidate) {
       heuristics.push("duckling-time");
       if (timeCandidate.type === "value" && timeCandidate.iso) {
@@ -141,7 +151,9 @@ export async function handler(req: Request) {
     };
     if (timeCandidate) {
       if (timeCandidate.type === "value" && timeCandidate.iso) {
-        structured.datetime = timeCandidate.iso;
+        if (!ambiguousTimeSnippet) {
+          structured.datetime = timeCandidate.iso;
+        }
       } else if (timeCandidate.type === "interval") {
         const { from, to } = timeCandidate;
         if (from && to) {
@@ -156,8 +168,12 @@ export async function handler(req: Request) {
     if (!structured.estimated_minutes) {
       needed.push("estimated_minutes");
     }
+    if (ambiguousTimeSnippet && !needed.includes("time_meridiem")) {
+      needed.push("time_meridiem");
+    }
 
     if (needed.length > 0 && mode === "conversational") {
+      const clarifyingContext = { ambiguousTime: ambiguousTimeSnippet ?? undefined };
       if (deepseekEnabled) {
         deepseekAttempted = true;
         const started = performance.now();
@@ -168,6 +184,7 @@ export async function handler(req: Request) {
             needed,
             structured,
             timezone,
+            context: clarifyingContext,
           });
           deepseekLatency = Math.round(performance.now() - started);
           if (question) {
@@ -190,7 +207,7 @@ export async function handler(req: Request) {
       if (!followUp) {
         followUp = {
           type: "clarify",
-          prompt: defaultClarifyingQuestion(needed),
+          prompt: defaultClarifyingQuestion(needed, clarifyingContext),
           missing: [...needed],
         };
       }
@@ -421,12 +438,19 @@ async function requestDeepSeekClarification(input: {
   needed: string[];
   structured: ParseResponse["structured"];
   timezone: string;
+  context?: { ambiguousTime?: string };
 }) {
   if (!input.apiKey) return null;
   const endpoint = Deno.env.get("DEEPSEEK_API_URL") ?? "https://api.deepseek.com/v1/chat/completions";
   const systemPrompt =
     "You help DiaGuru collect missing task details. Ask exactly one concise follow-up question to obtain the missing information. Never answer the question yourself.";
-  const userPrompt = buildDeepSeekUserPrompt(input);
+  const userPrompt = buildDeepSeekUserPrompt({
+    content: input.content,
+    needed: input.needed,
+    structured: input.structured,
+    timezone: input.timezone,
+    context: input.context,
+  });
 
   const res = await fetch(endpoint, {
     method: "POST",
@@ -462,6 +486,7 @@ function buildDeepSeekUserPrompt(input: {
   needed: string[];
   structured: ParseResponse["structured"];
   timezone: string;
+  context?: { ambiguousTime?: string };
 }) {
   const parts = [
     `Capture text: """${input.content}"""`,
@@ -480,6 +505,9 @@ function buildDeepSeekUserPrompt(input: {
   }
   if (structuredBits.length > 0) {
     parts.push(`Already parsed: ${structuredBits.join(", ")}`);
+  }
+  if (input.context?.ambiguousTime) {
+    parts.push(`Ambiguous time detected: ${input.context.ambiguousTime} (needs AM/PM clarification).`);
   }
   parts.push(
     "Ask a single short clarifying question to collect the missing field(s). Do not propose values; only ask for the information.",
@@ -516,7 +544,13 @@ function cleanupQuestion(question: string) {
   return trimmed.replace(/\s*\n\s*/g, " ").replace(/\s{2,}/g, " ");
 }
 
-function defaultClarifyingQuestion(missing: string[]) {
+function defaultClarifyingQuestion(
+  missing: string[],
+  context?: { ambiguousTime?: string },
+) {
+  if (missing.includes("time_meridiem") && context?.ambiguousTime) {
+    return `Did you mean ${context.ambiguousTime}am or ${context.ambiguousTime}pm?`;
+  }
   if (missing.includes("estimated_minutes")) {
     return "About how many minutes do you expect this to take?";
   }
@@ -530,7 +564,27 @@ export const __test__ = {
   cleanupQuestion,
   defaultClarifyingQuestion,
   buildDeepSeekUserPrompt,
+  detectAmbiguousMeridiemSnippet,
 };
+
+function detectAmbiguousMeridiemSnippet(source: string, fallbackText: string) {
+  const snippet = findAmbiguousTimeToken(source);
+  if (snippet) return snippet;
+  if (!source.trim()) {
+    return findAmbiguousTimeToken(fallbackText);
+  }
+  return null;
+}
+
+function findAmbiguousTimeToken(text: string) {
+  const durationRegex = /\b(hours?|hrs?|minutes?|mins?)\b/i;
+  if (durationRegex.test(text)) return null;
+  const meridiemRegex = /\b(a\.?m\.?|p\.?m\.?|am|pm)\b/i;
+  if (meridiemRegex.test(text)) return null;
+  const match = /\b(0?[1-9]|1[0-2])(:[0-5]\d)?\b/.exec(text);
+  if (!match) return null;
+  return match[0].replace(/^0/, "");
+}
 
 function describeError(prefix: string, error: unknown) {
   if (error instanceof Error) {
