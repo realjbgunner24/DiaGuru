@@ -10,7 +10,7 @@ const SEARCH_DAYS = 7;
 const DAY_END_HOUR = 22;
 const SLOT_INCREMENT_MINUTES = 15;
 
-class ScheduleError extends Error {
+export class ScheduleError extends Error {
   status: number;
   details?: unknown;
 
@@ -88,6 +88,19 @@ type AdvisorResult = {
   noteFragment?: string | null;
 };
 
+type CalendarClientCredentials = {
+  accountId: number;
+  accessToken: string;
+  refreshToken: string | null;
+  refreshed: boolean;
+};
+
+type GoogleCalendarActions = {
+  listEvents: (timeMin: string, timeMax: string) => Promise<CalendarEvent[]>;
+  deleteEvent: (eventId: string) => Promise<void>;
+  createEvent: (capture: CaptureEntryRow, slot: { start: Date; end: Date }) => Promise<string>;
+};
+
 export async function handler(req: Request) {
   try {
     const auth = req.headers.get("Authorization");
@@ -130,11 +143,16 @@ export async function handler(req: Request) {
     if (!calendarClient) {
       return json({ error: "Google Calendar not linked" }, 400);
     }
-    const { accessToken } = calendarClient;
+    const google = createGoogleCalendarActions({
+      credentials: calendarClient,
+      admin,
+      clientId,
+      clientSecret,
+    });
 
     if (action === "complete") {
       if (capture.calendar_event_id) {
-        await deleteCalendarEvent(accessToken, capture.calendar_event_id);
+        await google.deleteEvent(capture.calendar_event_id);
       }
       const { error: updateError } = await admin
         .from("capture_entries")
@@ -153,7 +171,7 @@ export async function handler(req: Request) {
     }
 
     if (action === "reschedule" && capture.calendar_event_id) {
-      await deleteCalendarEvent(accessToken, capture.calendar_event_id);
+      await google.deleteEvent(capture.calendar_event_id);
       await admin
         .from("capture_entries")
         .update({
@@ -181,7 +199,7 @@ export async function handler(req: Request) {
     const now = new Date();
     const timeMin = now.toISOString();
     const timeMax = new Date(now.getTime() + SEARCH_DAYS * 86400000).toISOString();
-    let events = await listCalendarEvents(accessToken, timeMin, timeMax);
+    let events = await google.listEvents(timeMin, timeMax);
     const busyIntervals = computeBusyIntervals(events);
 
     const requestPreferred = preferredStartIso
@@ -215,7 +233,7 @@ export async function handler(req: Request) {
           diaGuruConflicts.length > 0;
 
         if (canRebalance) {
-          rescheduleQueue = await reclaimDiaGuruConflicts(diaGuruConflicts, accessToken, admin);
+          rescheduleQueue = await reclaimDiaGuruConflicts(diaGuruConflicts, google, admin);
           if (rescheduleQueue.length > 0) {
             const removedIds = new Set(diaGuruConflicts.map((conflict) => conflict.id));
             events = events.filter((event) => !removedIds.has(event.id));
@@ -284,7 +302,7 @@ export async function handler(req: Request) {
         }
       }
 
-      const eventId = await createCalendarEvent(accessToken, capture, preferredSlot);
+      const eventId = await google.createEvent(capture, preferredSlot);
       registerInterval(busyIntervals, preferredSlot);
 
       if (rescheduleQueue.length > 0) {
@@ -336,7 +354,7 @@ export async function handler(req: Request) {
       return json({ error: "No available slot within the next week." }, 409);
     }
 
-    const eventId = await createCalendarEvent(accessToken, capture, candidate);
+    const eventId = await google.createEvent(capture, candidate);
 
     const { data: updated, error: updateError } = await admin
       .from("capture_entries")
@@ -376,7 +394,7 @@ if (import.meta.main) {
   Deno.serve(handler);
 }
 
-async function resolveCalendarClient(
+export async function resolveCalendarClient(
   admin: SupabaseClient<Database, "public">,
   userId: string,
   clientId: string,
@@ -384,7 +402,7 @@ async function resolveCalendarClient(
 ) {
   const { data: account, error: accountError } = await admin
     .from("calendar_accounts")
-    .select("id")
+    .select("id, needs_reconnect")
     .eq("user_id", userId)
     .eq("provider", "google")
     .single();
@@ -395,38 +413,42 @@ async function resolveCalendarClient(
     .select("access_token, refresh_token, expiry")
     .eq("account_id", account.id)
     .single();
-  if (tokenError || !tokenRow) return null;
+  if (tokenError || !tokenRow) {
+    await setCalendarReconnectFlag(admin, account.id, true);
+    return null;
+  }
 
   const typedToken = tokenRow as CalendarTokenRow;
 
-  let accessToken = typedToken.access_token;
-  const refreshToken = typedToken.refresh_token;
-  const expiry = typedToken.expiry ? Date.parse(typedToken.expiry) : 0;
-  const aboutToExpire = expiry <= Date.now() + 30_000;
+  const credentials: CalendarClientCredentials = {
+    accountId: account.id,
+    accessToken: typedToken.access_token,
+    refreshToken: typedToken.refresh_token,
+    refreshed: false,
+  };
 
-  if (aboutToExpire && refreshToken) {
-    const refreshed = await refreshGoogleToken(refreshToken, clientId, clientSecret);
-    if (!refreshed) return null;
-    accessToken = refreshed.access_token;
-    const calendarTokens = admin.from("calendar_tokens") as unknown as {
-      upsert: (
-        values: {
-          account_id: number;
-          access_token: string;
-          refresh_token: string | null;
-          expiry: string;
-        },
-      ) => Promise<unknown>;
-    };
-    await calendarTokens.upsert({
-      account_id: account.id,
-      access_token: refreshed.access_token,
-      refresh_token: refreshed.refresh_token ?? refreshToken,
-      expiry: new Date(Date.now() + (refreshed.expires_in ?? 0) * 1000).toISOString(),
+  const expiryMillis = typedToken.expiry ? Date.parse(typedToken.expiry) : 0;
+  const expiryIsValid = Number.isFinite(expiryMillis) && expiryMillis > 0;
+  const alreadyExpired = expiryIsValid ? expiryMillis <= Date.now() : true;
+  const expiresSoon = expiryIsValid ? expiryMillis <= Date.now() + 30_000 : true;
+  const needsRefresh =
+    !credentials.accessToken || alreadyExpired || expiresSoon || account.needs_reconnect;
+
+  if (needsRefresh) {
+    const refreshed = await refreshCalendarAccess({
+      credentials,
+      admin,
+      clientId,
+      clientSecret,
     });
+    if (!refreshed) {
+      await setCalendarReconnectFlag(admin, credentials.accountId, true);
+      return null;
+    }
   }
 
-  return { accessToken };
+  await setCalendarReconnectFlag(admin, credentials.accountId, false);
+  return credentials;
 }
 
 async function refreshGoogleToken(refreshToken: string, clientId: string, clientSecret: string) {
@@ -845,14 +867,14 @@ function registerInterval(intervals: { start: Date; end: Date }[], slot: Preferr
 
 async function reclaimDiaGuruConflicts(
   conflicts: ConflictSummary[],
-  accessToken: string,
+  google: GoogleCalendarActions,
   admin: SupabaseClient<Database, "public">,
 ) {
   const removed: CaptureEntryRow[] = [];
   for (const conflict of conflicts) {
     if (!conflict.captureId) continue;
     try {
-      await deleteCalendarEvent(accessToken, conflict.id);
+      await google.deleteEvent(conflict.id);
     } catch (error) {
       console.log("Failed to delete conflicting event", conflict.id, error);
     }
@@ -877,13 +899,13 @@ async function reclaimDiaGuruConflicts(
 
 async function rescheduleCaptures(args: {
   captures: CaptureEntryRow[];
-  accessToken: string;
+  google: GoogleCalendarActions;
   admin: SupabaseClient<Database, "public">;
   busyIntervals: { start: Date; end: Date }[];
   offsetMinutes: number;
   referenceNow: Date;
 }) {
-  const { captures, accessToken, admin, busyIntervals, offsetMinutes, referenceNow } = args;
+  const { captures, google, admin, busyIntervals, offsetMinutes, referenceNow } = args;
   const queue = [...captures].sort((a, b) => {
     const bUrgency = computeUrgencyScore(b, referenceNow, offsetMinutes);
     const aUrgency = computeUrgencyScore(a, referenceNow, offsetMinutes);
@@ -918,7 +940,7 @@ async function rescheduleCaptures(args: {
     }
 
     try {
-      const eventId = await createCalendarEvent(accessToken, capture, slot);
+      const eventId = await google.createEvent(capture, slot);
       const { error } = await admin
         .from("capture_entries")
         .update({
@@ -1236,10 +1258,16 @@ async function listCalendarEvents(accessToken: string, timeMin: string, timeMax:
 }
 
 async function deleteCalendarEvent(accessToken: string, eventId: string) {
-  await fetch(`${GOOGLE_EVENTS}/${eventId}`, {
+  const res = await fetch(`${GOOGLE_EVENTS}/${eventId}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  if (!res.ok) {
+    const payload = await safeParse(res);
+    const message =
+      extractGoogleError(payload) ?? `Failed to delete calendar event (status ${res.status})`;
+    throw new ScheduleError(message, res.status, payload);
+  }
 }
 
 async function createCalendarEvent(
@@ -1282,6 +1310,136 @@ async function createCalendarEvent(
     throw new ScheduleError("Google did not return an event id", 502, payload);
   }
   return identifier;
+}
+
+function createGoogleCalendarActions(options: {
+  credentials: CalendarClientCredentials;
+  admin: SupabaseClient<Database, "public">;
+  clientId: string;
+  clientSecret: string;
+}): GoogleCalendarActions {
+  const { credentials, admin, clientId, clientSecret } = options;
+
+  const run = async <T>(operation: (token: string) => Promise<T>): Promise<T> => {
+    let refreshed = false;
+    while (true) {
+      try {
+        const result = await operation(credentials.accessToken);
+        await setCalendarReconnectFlag(admin, credentials.accountId, false);
+        return result;
+      } catch (error) {
+        if (!refreshed && shouldAttemptTokenRefresh(error) && credentials.refreshToken) {
+          const didRefresh = await refreshCalendarAccess({
+            credentials,
+            admin,
+            clientId,
+            clientSecret,
+          });
+          if (didRefresh) {
+            refreshed = true;
+            continue;
+          }
+        }
+
+        if (isAuthError(error)) {
+          await setCalendarReconnectFlag(admin, credentials.accountId, true);
+          throw new ScheduleError("Google Calendar not linked", 400, error instanceof ScheduleError ? error.details : null);
+        }
+        throw error;
+      }
+    }
+  };
+
+  return {
+    listEvents: (timeMin, timeMax) => run((token) => listCalendarEvents(token, timeMin, timeMax)),
+    deleteEvent: (eventId) => run((token) => deleteCalendarEvent(token, eventId)),
+    createEvent: (capture, slot) => run((token) => createCalendarEvent(token, capture, slot)),
+  };
+}
+
+async function refreshCalendarAccess(args: {
+  credentials: CalendarClientCredentials;
+  admin: SupabaseClient<Database, "public">;
+  clientId: string;
+  clientSecret: string;
+}): Promise<boolean> {
+  const { credentials, admin, clientId, clientSecret } = args;
+  const refreshToken = credentials.refreshToken;
+  if (!refreshToken) return false;
+
+  const refreshed = await refreshGoogleToken(refreshToken, clientId, clientSecret);
+  if (!refreshed || typeof refreshed.access_token !== "string") {
+    return false;
+  }
+
+  const nextRefreshToken =
+    typeof refreshed.refresh_token === "string" && refreshed.refresh_token.trim().length > 0
+      ? refreshed.refresh_token
+      : refreshToken;
+
+  credentials.accessToken = refreshed.access_token;
+  credentials.refreshToken = nextRefreshToken;
+  credentials.refreshed = true;
+
+  const expiresIn =
+    typeof refreshed.expires_in === "number" && Number.isFinite(refreshed.expires_in) && refreshed.expires_in > 0
+      ? refreshed.expires_in
+      : 3600;
+
+  await persistCalendarToken(admin, {
+    accountId: credentials.accountId,
+    accessToken: credentials.accessToken,
+    refreshToken: nextRefreshToken,
+    expiresInSeconds: expiresIn,
+  });
+
+  return true;
+}
+
+async function persistCalendarToken(
+  admin: SupabaseClient<Database, "public">,
+  params: { accountId: number; accessToken: string; refreshToken: string | null; expiresInSeconds: number },
+) {
+  const expiryIso = new Date(Date.now() + Math.max(0, params.expiresInSeconds) * 1000).toISOString();
+  const calendarTokens = admin.from("calendar_tokens") as unknown as {
+    upsert: (
+      values: {
+        account_id: number;
+        access_token: string;
+        refresh_token: string | null;
+        expiry: string;
+      },
+    ) => Promise<unknown>;
+  };
+
+  await calendarTokens.upsert({
+    account_id: params.accountId,
+    access_token: params.accessToken,
+    refresh_token: params.refreshToken,
+    expiry: expiryIso,
+  });
+
+  return expiryIso;
+}
+
+async function setCalendarReconnectFlag(
+  admin: SupabaseClient<Database, "public">,
+  accountId: number,
+  needsReconnect: boolean,
+) {
+  try {
+    await admin.from("calendar_accounts").update({ needs_reconnect: needsReconnect }).eq("id", accountId);
+  } catch (error) {
+    console.log("Failed to update reconnect flag", error);
+  }
+}
+
+function shouldAttemptTokenRefresh(error: unknown) {
+  return error instanceof ScheduleError && error.status === 401;
+}
+
+function isAuthError(error: unknown) {
+  return error instanceof ScheduleError && (error.status === 401 || error.status === 403);
 }
 
 function parseEventDate(value: { dateTime?: string; date?: string }) {
@@ -1378,3 +1536,7 @@ function json(data: unknown, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+export const __test__ = {
+  createGoogleCalendarActions,
+};

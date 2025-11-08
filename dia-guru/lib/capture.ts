@@ -136,6 +136,7 @@ export type ParseCaptureArgs = {
 };
 
 export async function parseCapture(input: ParseCaptureArgs): Promise<ParseTaskResponse> {
+  console.log((await supabase.auth.getSession()))
   const { data, error } = await supabase.functions.invoke('parse-task', {
     body: {
       text: input.text,

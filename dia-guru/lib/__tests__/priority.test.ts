@@ -54,4 +54,74 @@ describe('computePriorityScore', () => {
     );
     expect(older).toBeGreaterThan(newer);
   });
+
+  it('adds strong boost for overdue deadline_time', () => {
+    const overdue = computePriorityScore(
+      {
+        estimated_minutes: 30,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+        constraint_type: 'deadline_time',
+        constraint_time: '2025-10-25T10:00:00Z',
+      },
+      reference,
+    );
+    const flexible = computePriorityScore(
+      {
+        estimated_minutes: 30,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+      },
+      reference,
+    );
+    expect(overdue).toBeGreaterThan(flexible + 20);
+  });
+
+  it('adds near-window boost for deadline_date within 48h', () => {
+    const near = computePriorityScore(
+      {
+        estimated_minutes: 30,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+        constraint_type: 'deadline_date',
+        constraint_date: '2025-10-26',
+      },
+      reference,
+    );
+    const far = computePriorityScore(
+      {
+        estimated_minutes: 30,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+        constraint_type: 'deadline_date',
+        constraint_date: '2025-10-30',
+      },
+      reference,
+    );
+    expect(near).toBeGreaterThan(far);
+  });
+
+  it('boosts start_time within 12h but not 24h away', () => {
+    const within = computePriorityScore(
+      {
+        estimated_minutes: 45,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+        constraint_type: 'start_time',
+        constraint_time: '2025-10-25T18:00:00Z',
+      },
+      reference,
+    );
+    const outside = computePriorityScore(
+      {
+        estimated_minutes: 45,
+        importance: 2,
+        created_at: '2025-10-24T12:00:00Z',
+        constraint_type: 'start_time',
+        constraint_time: '2025-10-26T18:00:00Z',
+      },
+      reference,
+    );
+    expect(within).toBeGreaterThan(outside);
+  });
 });

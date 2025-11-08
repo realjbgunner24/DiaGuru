@@ -9,6 +9,7 @@ const {
   cleanupQuestion,
   defaultClarifyingQuestion,
   buildDeepSeekUserPrompt,
+  detectAmbiguousMeridiemSnippet,
 } = __test__;
 
 Deno.test("pickDurationFromRegex handles hours and minutes", () => {
@@ -44,6 +45,17 @@ Deno.test("defaultClarifyingQuestion prefers duration wording", () => {
   assertStringIncludes(prompt.toLowerCase(), "minutes");
 });
 
+Deno.test("defaultClarifyingQuestion asks about meridiem when ambiguous", () => {
+  const prompt = defaultClarifyingQuestion(
+    ["time_meridiem"],
+    { ambiguousTime: "7:30" },
+  );
+  const normalized = prompt.toLowerCase();
+  assertStringIncludes(normalized, "7:30");
+  assertStringIncludes(normalized, "am");
+  assertStringIncludes(normalized, "pm");
+});
+
 Deno.test("buildDeepSeekUserPrompt embeds structured context", () => {
   const prompt = buildDeepSeekUserPrompt({
     content: "Finish the weekly summary",
@@ -54,4 +66,22 @@ Deno.test("buildDeepSeekUserPrompt embeds structured context", () => {
   assertStringIncludes(prompt, "weekly summary");
   assertStringIncludes(prompt, "Missing fields: estimated_minutes");
   assertStringIncludes(prompt, "Already parsed: estimated_minutes=45");
+});
+
+Deno.test("buildDeepSeekUserPrompt mentions ambiguous time context", () => {
+  const prompt = buildDeepSeekUserPrompt({
+    content: "call mom at 6",
+    needed: ["time_meridiem"],
+    structured: {},
+    timezone: "UTC",
+    context: { ambiguousTime: "6" },
+  });
+  const normalized = prompt.toLowerCase();
+  assertStringIncludes(normalized, "ambiguous time");
+  assertStringIncludes(normalized, "6");
+});
+
+Deno.test("detectAmbiguousMeridiemSnippet detects hh:mm without am/pm", () => {
+  const snippet = detectAmbiguousMeridiemSnippet("6:45", "");
+  assertEquals(snippet, "6:45");
 });

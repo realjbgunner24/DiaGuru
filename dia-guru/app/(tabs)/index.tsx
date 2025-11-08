@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSupabaseSession } from '@/hooks/useSupabaseSession';
+import CalendarHealthNotice from '@/components/CalendarHealthNotice';
 import {
   addCapture,
   Capture,
@@ -21,6 +22,7 @@ import {
   scheduleReminderAt,
 } from '@/lib/notifications';
 import { getAssistantModePreference } from '@/lib/preferences';
+import { connectGoogleCalendar, getCalendarHealth, type CalendarHealth } from '@/lib/google-connect';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -305,6 +307,9 @@ export default function HomeTab() {
   const [scheduledLoading, setScheduledLoading] = useState(true);
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [scheduledError, setScheduledError] = useState<string | null>(null);
+  const [calendarHealth, setCalendarHealth] = useState<CalendarHealth | null>(null);
+  const [calendarHealthError, setCalendarHealthError] = useState<string | null>(null);
+  const [calendarHealthChecking, setCalendarHealthChecking] = useState(false);
 
 
   const [refreshing, setRefreshing] = useState(false);
@@ -314,6 +319,7 @@ export default function HomeTab() {
   const autoSchedulingRef = useRef(false);
   const reminderRegistryRef = useRef<ReminderRegistry>({});
   const reminderSyncingRef = useRef(false);
+  const calendarHealthRequestRef = useRef(false);
   const [reminderLoaded, setReminderLoaded] = useState(false);
 
   useEffect(() => {
@@ -401,6 +407,28 @@ export default function HomeTab() {
     ensureReminders();
   }, [ensureReminders, reminderLoaded]);
 
+  const refreshCalendarHealth = useCallback(async () => {
+    if (!userId) {
+      setCalendarHealth(null);
+      setCalendarHealthError(null);
+      return;
+    }
+    if (calendarHealthRequestRef.current) return;
+    calendarHealthRequestRef.current = true;
+    setCalendarHealthChecking(true);
+    try {
+      const status = await getCalendarHealth();
+      setCalendarHealth(status);
+      setCalendarHealthError(null);
+    } catch (error) {
+      console.log('calendar health check failed', error);
+      setCalendarHealthError('Unable to reach Google Calendar right now.');
+    } finally {
+      setCalendarHealthChecking(false);
+      calendarHealthRequestRef.current = false;
+    }
+  }, [userId]);
+
   const loadPending = useCallback(async () => {
     if (!userId) return [];
     setPendingLoading(true);
@@ -446,22 +474,28 @@ export default function HomeTab() {
     if (!userId) return;
     (async () => {
       await synchronizeFromCalendar();
-      await Promise.all([loadPending(), loadScheduled()]);
+      await Promise.all([loadPending(), loadScheduled(), refreshCalendarHealth()]);
     })();
-  }, [loadPending, loadScheduled, synchronizeFromCalendar, userId]);
+  }, [loadPending, loadScheduled, refreshCalendarHealth, synchronizeFromCalendar, userId]);
+
+  useEffect(() => {
+    if (userId) return;
+    setCalendarHealth(null);
+    setCalendarHealthError(null);
+  }, [userId]);
 
   const onRefresh = useCallback(async () => {
     if (!userId) return;
     setRefreshing(true);
     try {
       await synchronizeFromCalendar();
-      await Promise.all([loadPending(), loadScheduled()]);
+      await Promise.all([loadPending(), loadScheduled(), refreshCalendarHealth()]);
     } catch (error) {
       console.log('refresh sync error', error);
     } finally {
       setRefreshing(false);
     }
-  }, [loadPending, loadScheduled, synchronizeFromCalendar, userId]);
+  }, [loadPending, loadScheduled, refreshCalendarHealth, synchronizeFromCalendar, userId]);
 
   const scheduleTopCapture = useCallback(
     async (
@@ -482,17 +516,22 @@ export default function HomeTab() {
           ...(options ?? {}),
         });
         await Promise.all([loadPending(), loadScheduled()]);
+        await refreshCalendarHealth();
         return response;
       } catch (error) {
         console.log('schedule-capture error', error);
-        Alert.alert('Scheduling failed', extractScheduleError(error));
+        const message = extractScheduleError(error);
+        Alert.alert('Scheduling failed', message);
+        if (message?.toLowerCase().includes('google calendar not linked')) {
+          refreshCalendarHealth();
+        }
         return null;
       } finally {
         setScheduling(false);
         autoSchedulingRef.current = false;
       }
     },
-    [loadPending, loadScheduled, pending, timezone, timezoneOffsetMinutes, userId],
+    [loadPending, loadScheduled, pending, refreshCalendarHealth, timezone, timezoneOffsetMinutes, userId],
   );
 
   const finalizeCapture = useCallback(
@@ -532,6 +571,13 @@ export default function HomeTab() {
     },
     [loadPending, userId],
   );
+
+  const handleReconnectCalendar = useCallback(() => {
+    connectGoogleCalendar().catch((error) => {
+      console.log('google connect error', error);
+      Alert.alert('Reconnect failed', 'Unable to open Google sign-in right now. Please try again.');
+    });
+  }, []);
 
   const attemptSchedule = useCallback(
     async (captureId: string) => {
@@ -953,6 +999,13 @@ export default function HomeTab() {
           contentContainerStyle={styles.scrollContent}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         >
+          <CalendarHealthNotice
+            health={calendarHealth}
+            error={calendarHealthError}
+            checking={calendarHealthChecking}
+            onReconnect={handleReconnectCalendar}
+            onRetry={refreshCalendarHealth}
+          />
           {captureForm}
           {scheduledSection}
         </ScrollView>
