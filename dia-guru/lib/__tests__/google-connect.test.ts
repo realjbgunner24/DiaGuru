@@ -62,7 +62,6 @@ describe('google-connect helpers', () => {
   it('throws when missing EXPO_PUBLIC_GOOGLE_CLIENT_ID', async () => {
     supabase.auth.getSession.mockResolvedValue({ data: { session: { access_token: 't' } } });
     const prev = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
-    // @ts-expect-error test env mutation
     delete process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
     try {
       await expect(connectGoogleCalendar()).rejects.toThrow('Missing EXPO_PUBLIC_GOOGLE_CLIENT_ID');

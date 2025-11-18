@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
 import { Alert, Button, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useRouter } from 'expo-router';
 import { requestNotificationPermission, scheduleIn, sendLocal } from '../../lib/notifications';
 import type { ParseMode } from '@/lib/capture';
 import { getAssistantModePreference, setAssistantModePreference } from '@/lib/preferences';
 
 export default function SettingsScreen() {
+  const router = useRouter();
   const [status, setStatus] = useState<'unknown' | 'granted' | 'denied'>('unknown');
-  const [assistantMode, setAssistantMode] = useState<ParseMode>('deterministic');
+  const [assistantMode, setAssistantMode] = useState<ParseMode>('conversational_strict');
   const [modeLoading, setModeLoading] = useState(true);
 
   const ask = async () => {
@@ -35,11 +37,11 @@ export default function SettingsScreen() {
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Assistant mode</Text>
         <Text style={styles.sectionSubtitle}>
-          Deterministic mode keeps everything on device. Conversational mode asks one clarifying question using
-          DeepSeek when details are missing.
+          The assistant always runs in conversational strict mode and asks one clarifying question using DeepSeek when
+          details are missing. There is no deterministic mode or non-LLM fallback.
         </Text>
         <View style={styles.modeRow}>
-          {(['deterministic', 'conversational'] as ParseMode[]).map((mode) => {
+          {(['conversational_strict'] as ParseMode[]).map((mode) => {
             const active = assistantMode === mode;
             return (
               <TouchableOpacity
@@ -48,15 +50,13 @@ export default function SettingsScreen() {
                 onPress={() => changeMode(mode)}
                 disabled={modeLoading}
               >
-                <Text style={[styles.modeChipText, active && styles.modeChipTextActive]}>
-                  {mode === 'deterministic' ? 'Deterministic' : 'Conversational'}
-                </Text>
+                <Text style={[styles.modeChipText, active && styles.modeChipTextActive]}>Conversational (strict)</Text>
               </TouchableOpacity>
             );
           })}
         </View>
         <Text style={styles.modeStatus}>
-          Current mode: {assistantMode === 'deterministic' ? 'Deterministic (form prompts)' : 'Conversational (asks once)'}
+          Current mode: Conversational strict (DeepSeek only, no fallbacks)
         </Text>
       </View>
 
@@ -67,6 +67,14 @@ export default function SettingsScreen() {
           <Button title="Send Test Notification" onPress={() => sendLocal('DiaGuru', 'Local test notification')} />
           <Button title="Schedule in 5 seconds" onPress={() => scheduleIn(5, 'DiaGuru', 'Scheduled test (5s)')} />
           <Text style={styles.helperText}>Permission: {status}</Text>
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Developer</Text>
+        <Text style={styles.sectionSubtitle}>Temporary tools for integration testing.</Text>
+        <View style={{ gap: 12 }}>
+          <Button title="Open DeepSeek Tester" onPress={() => router.push('/test-deepseek')} />
         </View>
       </View>
     </View>

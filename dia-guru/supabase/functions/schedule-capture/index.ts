@@ -1,14 +1,16 @@
-import { createClient } from "@supabase/supabase-js";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
 import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
+import { computePriorityScore, type PriorityInput } from "../../../shared/priority.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 
 const BUFFER_MINUTES = 30;
+const COMPRESSED_BUFFER_MINUTES = 15;
 const SEARCH_DAYS = 7;
 const DAY_END_HOUR = 22;
 const SLOT_INCREMENT_MINUTES = 15;
+const STABILITY_WINDOW_MINUTES = 30;
 
 export class ScheduleError extends Error {
   status: number;
@@ -24,6 +26,8 @@ export class ScheduleError extends Error {
 type CalendarEvent = {
   id: string;
   summary?: string;
+  etag?: string;
+  updated?: string;
   start: { dateTime?: string; date?: string };
   end: { dateTime?: string; date?: string };
   extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
@@ -97,8 +101,36 @@ type CalendarClientCredentials = {
 
 type GoogleCalendarActions = {
   listEvents: (timeMin: string, timeMax: string) => Promise<CalendarEvent[]>;
-  deleteEvent: (eventId: string) => Promise<void>;
-  createEvent: (capture: CaptureEntryRow, slot: { start: Date; end: Date }) => Promise<string>;
+  deleteEvent: (options: { eventId: string; etag?: string | null }) => Promise<void>;
+  createEvent: (options: {
+    capture: CaptureEntryRow;
+    slot: { start: Date; end: Date };
+    planId?: string | null;
+    actionId: string;
+    priorityScore: number;
+    description?: string;
+  }) => Promise<{ id: string; etag: string | null }>;
+  getEvent: (eventId: string) => Promise<CalendarEvent | null>;
+};
+
+type CaptureSnapshot = {
+  status: string | null;
+  planned_start: string | null;
+  planned_end: string | null;
+  calendar_event_id: string | null;
+  calendar_event_etag: string | null;
+  freeze_until: string | null;
+  plan_id: string | null;
+};
+
+type PlanActionRecord = {
+  actionId: string;
+  planId: string;
+  captureId: string;
+  captureContent: string;
+  actionType: "scheduled" | "rescheduled" | "unscheduled";
+  prev: CaptureSnapshot;
+  next: CaptureSnapshot;
 };
 
 export async function handler(req: Request) {
@@ -152,7 +184,10 @@ export async function handler(req: Request) {
 
     if (action === "complete") {
       if (capture.calendar_event_id) {
-        await google.deleteEvent(capture.calendar_event_id);
+        await google.deleteEvent({
+          eventId: capture.calendar_event_id,
+          etag: capture.calendar_event_etag ?? undefined,
+        });
       }
       const { error: updateError } = await admin
         .from("capture_entries")
@@ -161,9 +196,11 @@ export async function handler(req: Request) {
           last_check_in: new Date().toISOString(),
           scheduling_notes: "Marked completed by user.",
           calendar_event_id: null,
+          calendar_event_etag: null,
           planned_start: null,
           planned_end: null,
           scheduled_for: null,
+          freeze_until: null,
         })
         .eq("id", capture.id);
       if (updateError) return json({ error: updateError.message }, 500);
@@ -171,16 +208,21 @@ export async function handler(req: Request) {
     }
 
     if (action === "reschedule" && capture.calendar_event_id) {
-      await google.deleteEvent(capture.calendar_event_id);
+      await google.deleteEvent({
+        eventId: capture.calendar_event_id,
+        etag: capture.calendar_event_etag ?? undefined,
+      });
       await admin
         .from("capture_entries")
         .update({
           calendar_event_id: null,
+          calendar_event_etag: null,
           planned_start: null,
           planned_end: null,
           scheduling_notes: "Rescheduling initiated.",
           status: "pending",
           scheduled_for: null,
+          freeze_until: null,
         })
         .eq("id", capture.id);
     }
@@ -197,16 +239,51 @@ export async function handler(req: Request) {
 
     const durationMinutes = Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
     const now = new Date();
+    const planId = crypto.randomUUID();
+    const planActions: PlanActionRecord[] = [];
+    let planRunCreated = false;
+
+    const ensurePlanRun = async () => {
+      if (planRunCreated) return;
+      const { error } = await admin
+        .from("plan_runs")
+        .insert({ id: planId, user_id: userId })
+        .select("id")
+        .single();
+      if (error) {
+        throw new ScheduleError("Failed to register scheduling plan.", 500, error);
+      }
+      planRunCreated = true;
+    };
+
+    const recordPlanAction = async (action: Omit<PlanActionRecord, "planId">) => {
+      await ensurePlanRun();
+      planActions.push({ ...action, planId });
+    };
+
+    const finalizePlan = async () => {
+      if (!planRunCreated || planActions.length === 0) return null;
+      const rows = planActions.map((action) => convertPlanActionForInsert(action));
+      const { error } = await admin.from("plan_actions").insert(rows);
+      if (error) {
+        throw new ScheduleError("Failed to persist plan audit trail.", 500, error);
+      }
+      const summaryText = buildPlanSummaryText(planActions);
+      await admin.from("plan_runs").update({ summary: summaryText }).eq("id", planId);
+      return buildPlanSummary(planId, planActions);
+    };
     const timeMin = now.toISOString();
     const timeMax = new Date(now.getTime() + SEARCH_DAYS * 86400000).toISOString();
     let events = await google.listEvents(timeMin, timeMax);
-    const busyIntervals = computeBusyIntervals(events);
+    let eventsById = new Map(events.map((event) => [event.id, event]));
+    let busyIntervals = computeBusyIntervals(events);
 
     const requestPreferred = preferredStartIso
       ? parsePreferredSlot(preferredStartIso, preferredEndIso, durationMinutes)
       : null;
 
     const plan = computeSchedulingPlan(capture, durationMinutes, offsetMinutes, now);
+    const capturePriority = priorityForCapture(capture, now);
     const preferredSlot = requestPreferred ?? plan.preferredSlot;
 
     if (preferredSlot) {
@@ -224,52 +301,34 @@ export async function handler(req: Request) {
 
       let rescheduleQueue: CaptureEntryRow[] = [];
 
-      if (!allowOverlap && (hasConflict || !slotWithinWindow)) {
-        const canRebalance =
-          plan.mode !== 'flexible' &&
-          slotWithinWindow &&
-          conflicts.length > 0 &&
-          externalConflicts.length === 0 &&
-          diaGuruConflicts.length > 0;
-
-        if (canRebalance) {
-          rescheduleQueue = await reclaimDiaGuruConflicts(diaGuruConflicts, google, admin);
-          if (rescheduleQueue.length > 0) {
-            const removedIds = new Set(diaGuruConflicts.map((conflict) => conflict.id));
-            events = events.filter((event) => !removedIds.has(event.id));
-            busyIntervals.splice(0, busyIntervals.length, ...computeBusyIntervals(events));
-          } else {
-            const suggestion = findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, {
-              startFrom: addMinutes(preferredSlot.end, SLOT_INCREMENT_MINUTES),
-              referenceNow: now,
-            });
-            const llmConfig = resolveLlmConfig();
-            const { decision, note } = await buildConflictDecision({
-              capture,
-              preferredSlot,
-              conflicts,
-              suggestion,
-              timezone,
-              offsetMinutes,
-              outsideWindow: !slotWithinWindow,
-              llmConfig,
-              busyIntervals,
-            });
-
-            await admin
-              .from("capture_entries")
-              .update({
-                scheduling_notes: note,
-              })
-              .eq("id", capture.id);
-
-            return json({
-              message: decision.message,
-              capture,
-              decision,
-            });
-          }
+      // Determine if overlap is actually allowed under policy
+      let effectiveAllowOverlap = allowOverlap;
+      if (effectiveAllowOverlap) {
+        // Must be inside working window
+        if (!slotWithinWindow) {
+          effectiveAllowOverlap = false;
+        } else if (externalConflicts.length > 0) {
+          // Never overlap external events
+          effectiveAllowOverlap = false;
         } else {
+          // Respect cannot_overlap flags for current and conflicting DiaGuru captures
+          const currentCannot = readCannotOverlapFromNotes(capture);
+          if (currentCannot) {
+            effectiveAllowOverlap = false;
+          } else if (diaGuruConflicts.length > 0) {
+            const conflictMap = await loadConflictCaptures(admin, diaGuruConflicts);
+            for (const v of conflictMap.values()) {
+              if (readCannotOverlapFromNotes(v)) {
+                effectiveAllowOverlap = false;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (!effectiveAllowOverlap && (hasConflict || !slotWithinWindow)) {
+        const respondWithConflictDecision = async () => {
           const suggestion = findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, {
             startFrom: addMinutes(preferredSlot.end, SLOT_INCREMENT_MINUTES),
             referenceNow: now,
@@ -285,13 +344,12 @@ export async function handler(req: Request) {
             outsideWindow: !slotWithinWindow,
             llmConfig,
             busyIntervals,
+            admin,
           });
 
           await admin
             .from("capture_entries")
-            .update({
-              scheduling_notes: note,
-            })
+            .update({ scheduling_notes: note })
             .eq("id", capture.id);
 
           return json({
@@ -299,28 +357,114 @@ export async function handler(req: Request) {
             capture,
             decision,
           });
+        };
+
+        let captureMap: Map<string, CaptureEntryRow> | null = null;
+        let selectedConflicts: ConflictSummary[] = [];
+        let canRebalance = false;
+
+        if (
+          plan.mode !== "flexible" &&
+          slotWithinWindow &&
+          conflicts.length > 0 &&
+          externalConflicts.length === 0 &&
+          diaGuruConflicts.length > 0
+        ) {
+          captureMap = await loadConflictCaptures(admin, diaGuruConflicts);
+          if (captureMap.size > 0) {
+            const movable: ConflictSummary[] = [];
+            let hasLocked = false;
+
+            for (const conflict of diaGuruConflicts) {
+              const blocker = conflict.captureId ? captureMap.get(conflict.captureId) : null;
+              if (!blocker) {
+                hasLocked = true;
+                break;
+              }
+              const frozen = hasActiveFreeze(blocker, now);
+              const stabilityLocked = withinStabilityWindow(blocker, now) && plan.mode !== "deadline";
+              if (frozen || stabilityLocked) {
+                hasLocked = true;
+                break;
+              }
+              movable.push(conflict);
+            }
+
+            if (!hasLocked && movable.length > 0) {
+              const outranksAll = movable.every((conflict) => {
+                const blocker = conflict.captureId ? captureMap!.get(conflict.captureId) : null;
+                if (!blocker) return false;
+                const blockerPriority = priorityForCapture(blocker, now);
+                return capturePriority > blockerPriority;
+              });
+
+              if (outranksAll) {
+                const preemptionPlan = selectMinimalPreemptionSet({
+                  slot: preferredSlot,
+                  events,
+                  candidateIds: movable.map((conflict) => conflict.id),
+                  offsetMinutes,
+                  allowCompressedBuffer: plan.mode === "deadline",
+                });
+                if (preemptionPlan) {
+                  const idSet = new Set(preemptionPlan.ids);
+                  selectedConflicts = movable.filter((conflict) => idSet.has(conflict.id));
+                  canRebalance = selectedConflicts.length > 0;
+                }
+              }
+            }
+          }
+        }
+
+        if (canRebalance && selectedConflicts.length > 0 && captureMap) {
+        rescheduleQueue = await reclaimDiaGuruConflicts(selectedConflicts, google, admin, {
+          captureMap,
+          eventsById,
+          planId,
+          recordPlanAction,
+        });
+          if (rescheduleQueue.length > 0) {
+            const removedIds = new Set(selectedConflicts.map((conflict) => conflict.id));
+            events = events.filter((event) => !removedIds.has(event.id));
+            eventsById = new Map(events.map((event) => [event.id, event]));
+            busyIntervals = computeBusyIntervals(events);
+          } else {
+            return await respondWithConflictDecision();
+          }
+        } else {
+          return await respondWithConflictDecision();
         }
       }
 
-      const eventId = await google.createEvent(capture, preferredSlot);
+      const actionId = crypto.randomUUID();
+      const prevSnapshot = snapshotFromRow(capture);
+      const createdEvent = await google.createEvent({
+        capture,
+        slot: preferredSlot,
+        planId,
+        actionId,
+        priorityScore: capturePriority,
+      });
       registerInterval(busyIntervals, preferredSlot);
 
       if (rescheduleQueue.length > 0) {
         await rescheduleCaptures({
           captures: rescheduleQueue,
-          accessToken,
           admin,
           busyIntervals,
           offsetMinutes,
           referenceNow: now,
+          google,
+          planId,
+          recordPlanAction,
         });
       }
 
       const schedulingNote = rescheduleQueue.length > 0
         ? "Scheduled at preferred slot after auto rebalancing existing DiaGuru sessions."
         : allowOverlap
-        ? "Scheduled at preferred slot with overlap permitted by user."
-        : "Scheduled at preferred slot requested by user.";
+          ? "Scheduled at preferred slot with overlap permitted by user."
+          : "Scheduled at preferred slot requested by user.";
 
       const { data: updated, error: updateError } = await admin
         .from("capture_entries")
@@ -329,7 +473,10 @@ export async function handler(req: Request) {
           planned_start: preferredSlot.start.toISOString(),
           planned_end: preferredSlot.end.toISOString(),
           scheduled_for: preferredSlot.start.toISOString(),
-          calendar_event_id: eventId,
+          calendar_event_id: createdEvent.id,
+          calendar_event_etag: createdEvent.etag,
+          plan_id: planId,
+          freeze_until: null,
           scheduling_notes: schedulingNote,
         })
         .eq("id", capture.id)
@@ -337,9 +484,21 @@ export async function handler(req: Request) {
         .single();
 
       if (updateError) return json({ error: updateError.message }, 500);
+
+      await recordPlanAction({
+        actionId,
+        captureId: capture.id,
+        captureContent: capture.content,
+        actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+        prev: prevSnapshot,
+        next: snapshotFromRow(updated as CaptureEntryRow),
+      });
+
+      const planSummary = await finalizePlan();
       return json({
         message: "Capture scheduled.",
         capture: updated,
+        planSummary,
       });
     }
 
@@ -349,31 +508,55 @@ export async function handler(req: Request) {
       busyIntervals,
       offsetMinutes,
       referenceNow: now,
+      isSoftStart: capture.is_soft_start,
     });
     if (!candidate) {
       return json({ error: "No available slot within the next week." }, 409);
     }
 
-    const eventId = await google.createEvent(capture, candidate);
+    const autoActionId = crypto.randomUUID();
+    const prevSnapshot = snapshotFromRow(capture);
+    const createdEvent = await google.createEvent({
+      capture,
+      slot: candidate,
+      planId,
+      actionId: autoActionId,
+      priorityScore: capturePriority,
+    });
 
     const { data: updated, error: updateError } = await admin
       .from("capture_entries")
       .update({
         status: "scheduled",
-        planned_start: candidate.start.toISOString(),
-        planned_end: candidate.end.toISOString(),
-        scheduled_for: candidate.start.toISOString(),
-        calendar_event_id: eventId,
-        scheduling_notes: `Scheduled automatically with ${BUFFER_MINUTES} minute buffer.`,
-      })
+          planned_start: candidate.start.toISOString(),
+          planned_end: candidate.end.toISOString(),
+          scheduled_for: candidate.start.toISOString(),
+          calendar_event_id: createdEvent.id,
+          calendar_event_etag: createdEvent.etag,
+          plan_id: planId,
+          freeze_until: null,
+          scheduling_notes: `Scheduled automatically with ${BUFFER_MINUTES} minute buffer.`,
+        })
       .eq("id", capture.id)
       .select("*")
       .single();
 
     if (updateError) return json({ error: updateError.message }, 500);
+
+    await recordPlanAction({
+      actionId: autoActionId,
+      captureId: capture.id,
+      captureContent: capture.content,
+      actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+      prev: prevSnapshot,
+      next: snapshotFromRow(updated as CaptureEntryRow),
+    });
+
+    const planSummary = await finalizePlan();
     return json({
       message: "Capture scheduled.",
       capture: updated,
+      planSummary,
     });
   } catch (error) {
     if (error instanceof ScheduleError) {
@@ -508,15 +691,15 @@ function findNextAvailableSlot(
   return null;
 }
 
-function computeBusyIntervals(events: CalendarEvent[]) {
+function computeBusyIntervals(events: CalendarEvent[], bufferMinutes = BUFFER_MINUTES) {
   const intervals = events
     .map((event) => {
       const start = parseEventDate(event.start);
       const end = parseEventDate(event.end);
       if (!start || !end) return null;
       return {
-        start: addMinutes(start, -BUFFER_MINUTES),
-        end: addMinutes(end, BUFFER_MINUTES),
+        start: addMinutes(start, -bufferMinutes),
+        end: addMinutes(end, bufferMinutes),
       };
     })
     .filter(Boolean) as { start: Date; end: Date }[];
@@ -760,8 +943,9 @@ function scheduleWithPlan(args: {
   busyIntervals: { start: Date; end: Date }[];
   offsetMinutes: number;
   referenceNow: Date;
+  isSoftStart?: boolean;
 }): PreferredSlot | null {
-  const { plan, durationMinutes, busyIntervals, offsetMinutes, referenceNow } = args;
+  const { plan, durationMinutes, busyIntervals, offsetMinutes, referenceNow, isSoftStart } = args;
   if (plan.preferredSlot) {
     const adjusted = adjustSlotToReference(plan.preferredSlot, referenceNow);
     if (isSlotFeasible(adjusted, offsetMinutes, busyIntervals)) {
@@ -787,7 +971,8 @@ function scheduleWithPlan(args: {
   }
 
   if (plan.mode === "start" && plan.preferredSlot) {
-    const toleranceEnd = addMinutes(plan.preferredSlot.start, 60);
+    const toleranceMinutes = isSoftStart ? 120 : 60;
+    const toleranceEnd = addMinutes(plan.preferredSlot.start, toleranceMinutes);
     const windowSlot = findSlotWithinWindow(busyIntervals, durationMinutes, offsetMinutes, {
       windowStart: plan.preferredSlot.start,
       windowEnd: toleranceEnd,
@@ -799,33 +984,137 @@ function scheduleWithPlan(args: {
   return findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, { referenceNow });
 }
 
-const DEADLINE_URGENCY_BONUS = 30;
-const DEADLINE_WINDOW_HOURS = 48;
-const START_WINDOW_HOURS = 12;
+export function priorityForCapture(capture: CaptureEntryRow, referenceNow: Date) {
+  return computePriorityScore(buildPriorityInput(capture), referenceNow);
+}
 
-function computeUrgencyScore(
-  capture: CaptureEntryRow,
-  referenceNow: Date,
-  offsetMinutes: number,
-): number {
-  const type = normalizeConstraintType(capture.constraint_type);
-  const deadline = resolveDeadlineFromCapture(capture, offsetMinutes);
-  if (deadline) {
-    const hoursUntil = (deadline.getTime() - referenceNow.getTime()) / 1000 / 60 / 60;
-    if (hoursUntil <= 0) {
-      return DEADLINE_URGENCY_BONUS + capture.importance;
-    }
-    if (type === "deadline_time" || type === "deadline_date") {
-      return (
-        Math.max(0, DEADLINE_WINDOW_HOURS - hoursUntil) + capture.importance
-      );
-    }
-    if (type === "start_time" || type === "window") {
-      return Math.max(0, START_WINDOW_HOURS - Math.abs(hoursUntil)) + capture.importance;
+function buildPriorityInput(capture: CaptureEntryRow): PriorityInput {
+  let urgency: number | null = null;
+  let impact: number | null = null;
+  let reschedule_penalty: number | null = null;
+  // Prefer direct DB columns when available
+  if (typeof capture.urgency === 'number') urgency = capture.urgency;
+  if (typeof capture.impact === 'number') impact = capture.impact;
+  if (typeof capture.reschedule_penalty === 'number') reschedule_penalty = capture.reschedule_penalty;
+  if (urgency == null || impact == null || reschedule_penalty == null) {
+    try {
+      const notes = typeof (capture as any).scheduling_notes === 'string' ? (capture as any).scheduling_notes : null;
+      if (notes && notes.trim().length > 0) {
+        const parsed = JSON.parse(notes);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.importance && typeof parsed.importance === 'object') {
+            const imp = parsed.importance as Record<string, unknown>;
+            const num = (v: unknown) => (typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : null);
+            if (urgency == null) urgency = num(imp.urgency);
+            if (impact == null) impact = num(imp.impact);
+            if (reschedule_penalty == null) reschedule_penalty = num(imp.reschedule_penalty);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return {
+    estimated_minutes: capture.estimated_minutes ?? null,
+    importance: capture.importance ?? 1,
+    urgency: urgency ?? null,
+    impact: impact ?? null,
+    reschedule_penalty: reschedule_penalty ?? null,
+    created_at: capture.created_at ?? new Date().toISOString(),
+    constraint_type: capture.constraint_type,
+    constraint_time: capture.constraint_time,
+    constraint_end: capture.constraint_end,
+    constraint_date: capture.constraint_date,
+    original_target_time: capture.original_target_time,
+    deadline_at: capture.deadline_at,
+    window_start: capture.window_start,
+    window_end: capture.window_end,
+    start_target_at: capture.start_target_at,
+    is_soft_start: capture.is_soft_start,
+    externality_score: capture.externality_score,
+    reschedule_count: capture.reschedule_count,
+  };
+}
+
+function hasActiveFreeze(capture: CaptureEntryRow, referenceNow: Date) {
+  if (!capture.freeze_until) return false;
+  const freezeTs = Date.parse(capture.freeze_until);
+  if (!Number.isFinite(freezeTs)) return false;
+  return freezeTs > referenceNow.getTime();
+}
+
+function withinStabilityWindow(capture: CaptureEntryRow, referenceNow: Date) {
+  if (!capture.planned_start) return false;
+  const plannedTs = Date.parse(capture.planned_start);
+  if (!Number.isFinite(plannedTs)) return false;
+  return plannedTs - referenceNow.getTime() <= STABILITY_WINDOW_MINUTES * 60_000;
+}
+
+function selectMinimalPreemptionSet(args: {
+  slot: PreferredSlot;
+  events: CalendarEvent[];
+  candidateIds: string[];
+  offsetMinutes: number;
+  allowCompressedBuffer: boolean;
+}) {
+  if (args.candidateIds.length === 0) return null;
+  const buffers = args.allowCompressedBuffer
+    ? [BUFFER_MINUTES, COMPRESSED_BUFFER_MINUTES]
+    : [BUFFER_MINUTES];
+  const uniqueBuffers = Array.from(new Set(buffers));
+  const maxCombinationSize = Math.min(args.candidateIds.length, 4);
+
+  for (const buffer of uniqueBuffers) {
+    for (let size = 1; size <= maxCombinationSize; size++) {
+      const combos = generateCombinations(args.candidateIds, size, 64);
+      for (const combo of combos) {
+        const removalSet = new Set(combo);
+        const filteredEvents = args.events.filter((event) => !removalSet.has(event.id));
+        const intervals = computeBusyIntervals(filteredEvents, buffer);
+        if (isSlotFeasible(args.slot, args.offsetMinutes, intervals)) {
+          return { ids: combo, bufferMinutes: buffer };
+        }
+      }
     }
   }
 
-  return capture.importance;
+  return null;
+}
+
+function readCannotOverlapFromNotes(capture: CaptureEntryRow): boolean {
+  if (typeof (capture as any).cannot_overlap === 'boolean') return Boolean((capture as any).cannot_overlap);
+  try {
+    const raw = (capture as any).scheduling_notes as string | null | undefined;
+    if (!raw || typeof raw !== 'string') return false;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.flexibility && typeof parsed.flexibility === 'object') {
+      return Boolean((parsed.flexibility as any).cannot_overlap);
+    }
+  } catch {}
+  return false;
+}
+
+function generateCombinations<T>(items: T[], size: number, limit = 64): T[][] {
+  if (size <= 0) return [[]];
+  if (size > items.length) return [];
+  const results: T[][] = [];
+
+  const backtrack = (start: number, path: T[]) => {
+    if (results.length >= limit) return;
+    if (path.length === size) {
+      results.push([...path]);
+      return;
+    }
+    for (let i = start; i < items.length; i++) {
+      path.push(items[i]);
+      backtrack(i + 1, path);
+      path.pop();
+      if (results.length >= limit) return;
+    }
+  };
+
+  backtrack(0, []);
+  return results;
 }
 
 function collectConflictingEvents(slot: PreferredSlot, events: CalendarEvent[]): ConflictSummary[] {
@@ -869,23 +1158,55 @@ async function reclaimDiaGuruConflicts(
   conflicts: ConflictSummary[],
   google: GoogleCalendarActions,
   admin: SupabaseClient<Database, "public">,
+  options: {
+    captureMap: Map<string, CaptureEntryRow>;
+    eventsById: Map<string, CalendarEvent>;
+    planId: string;
+    recordPlanAction: (action: Omit<PlanActionRecord, "planId">) => Promise<void>;
+  },
 ) {
   const removed: CaptureEntryRow[] = [];
   for (const conflict of conflicts) {
     if (!conflict.captureId) continue;
+    const blocker = options.captureMap.get(conflict.captureId);
+    const prevSnapshot = blocker ? snapshotFromRow(blocker) : null;
     try {
-      await google.deleteEvent(conflict.id);
+      const event = options.eventsById.get(conflict.id);
+      await google.deleteEvent({
+        eventId: conflict.id,
+        etag: blocker?.calendar_event_etag ?? event?.etag,
+      });
     } catch (error) {
-      console.log("Failed to delete conflicting event", conflict.id, error);
+      if (error instanceof ScheduleError && error.status === 412) {
+        const refreshed = await google.getEvent(conflict.id);
+        if (refreshed) {
+          options.eventsById.set(conflict.id, refreshed);
+          try {
+            await google.deleteEvent({
+              eventId: conflict.id,
+              etag: refreshed.etag ?? undefined,
+            });
+          } catch (retryError) {
+            console.log("Retry delete failed for event", conflict.id, retryError);
+          }
+        }
+      } else {
+        console.log("Failed to delete conflicting event", conflict.id, error);
+      }
     }
+    const nextRescheduleCount = (options.captureMap.get(conflict.captureId)?.reschedule_count ?? 0) + 1;
     const { data, error } = await admin
       .from("capture_entries")
       .update({
         status: "pending",
         calendar_event_id: null,
+        calendar_event_etag: null,
         planned_start: null,
         planned_end: null,
         scheduled_for: null,
+        reschedule_count: nextRescheduleCount,
+        plan_id: options.planId,
+        freeze_until: null,
         scheduling_notes: "Rebalanced to honour a higher priority constraint.",
       })
       .eq("id", conflict.captureId)
@@ -893,8 +1214,47 @@ async function reclaimDiaGuruConflicts(
       .single();
     if (error || !data) continue;
     removed.push(data as CaptureEntryRow);
+    options.eventsById.delete(conflict.id);
+    if (prevSnapshot) {
+      await options.recordPlanAction({
+        actionId: crypto.randomUUID(),
+        captureId: conflict.captureId,
+        captureContent: blocker?.content ?? "Capture",
+        actionType: "unscheduled",
+        prev: prevSnapshot,
+        next: snapshotFromRow(data as CaptureEntryRow),
+      });
+    }
   }
   return removed;
+}
+
+async function loadConflictCaptures(
+  admin: SupabaseClient<Database, "public">,
+  conflicts: ConflictSummary[],
+) {
+  const ids = Array.from(
+    new Set(
+      conflicts
+        .map((conflict) => conflict.captureId)
+        .filter((value): value is string => Boolean(value)),
+    ),
+  );
+  if (ids.length === 0) {
+    return new Map();
+  }
+  const { data, error } = await admin
+    .from("capture_entries")
+    .select("*")
+    .in("id", ids);
+  if (error || !data) {
+    return new Map();
+  }
+  const map = new Map<string, CaptureEntryRow>();
+  for (const row of data as CaptureEntryRow[]) {
+    map.set(row.id, row);
+  }
+  return map;
 }
 
 async function rescheduleCaptures(args: {
@@ -904,12 +1264,23 @@ async function rescheduleCaptures(args: {
   busyIntervals: { start: Date; end: Date }[];
   offsetMinutes: number;
   referenceNow: Date;
+  planId: string;
+  recordPlanAction: (action: Omit<PlanActionRecord, "planId">) => Promise<void>;
 }) {
-  const { captures, google, admin, busyIntervals, offsetMinutes, referenceNow } = args;
+  const {
+    captures,
+    google,
+    admin,
+    busyIntervals,
+    offsetMinutes,
+    referenceNow,
+    planId,
+    recordPlanAction,
+  } = args;
   const queue = [...captures].sort((a, b) => {
-    const bUrgency = computeUrgencyScore(b, referenceNow, offsetMinutes);
-    const aUrgency = computeUrgencyScore(a, referenceNow, offsetMinutes);
-    if (bUrgency !== aUrgency) return bUrgency - aUrgency;
+    const bPriority = priorityForCapture(b, referenceNow);
+    const aPriority = priorityForCapture(a, referenceNow);
+    if (bPriority !== aPriority) return bPriority - aPriority;
     if (b.importance !== a.importance) return b.importance - a.importance;
     const aMinutes = Math.max(5, Math.min(a.estimated_minutes ?? 30, 480));
     const bMinutes = Math.max(5, Math.min(b.estimated_minutes ?? 30, 480));
@@ -926,6 +1297,7 @@ async function rescheduleCaptures(args: {
       busyIntervals,
       offsetMinutes,
       referenceNow,
+      isSoftStart: capture.is_soft_start,
     });
 
     if (!slot) {
@@ -940,20 +1312,42 @@ async function rescheduleCaptures(args: {
     }
 
     try {
-      const eventId = await google.createEvent(capture, slot);
-      const { error } = await admin
+      const actionId = crypto.randomUUID();
+      const priorityScore = priorityForCapture(capture, referenceNow);
+      const createdEvent = await google.createEvent({
+        capture,
+        slot,
+        planId,
+        actionId,
+        priorityScore,
+      });
+      const prevSnapshot = snapshotFromRow(capture);
+      const { data, error } = await admin
         .from("capture_entries")
         .update({
           status: "scheduled",
           planned_start: slot.start.toISOString(),
           planned_end: slot.end.toISOString(),
           scheduled_for: slot.start.toISOString(),
-          calendar_event_id: eventId,
+          calendar_event_id: createdEvent.id,
+          calendar_event_etag: createdEvent.etag,
+          plan_id: planId,
+          freeze_until: null,
           scheduling_notes: "Rescheduled automatically after calendar reflow.",
         })
-        .eq("id", capture.id);
-      if (!error) {
+        .eq("id", capture.id)
+        .select("*")
+        .single();
+      if (!error && data) {
         registerInterval(busyIntervals, slot);
+        await recordPlanAction({
+          actionId,
+          captureId: capture.id,
+          captureContent: capture.content,
+          actionType: "rescheduled",
+          prev: prevSnapshot,
+          next: snapshotFromRow(data as CaptureEntryRow),
+        });
       }
     } catch (error) {
       console.log("Failed to reschedule capture", capture.id, error);
@@ -988,6 +1382,7 @@ async function buildConflictDecision(args: {
   outsideWindow: boolean;
   llmConfig: LlmConfig | null;
   busyIntervals: { start: Date; end: Date }[];
+  admin: SupabaseClient<Database, "public">;
 }): Promise<ConflictDecision> {
   const { capture, preferredSlot } = args;
   const suggestionPayload = args.suggestion
@@ -1006,11 +1401,39 @@ async function buildConflictDecision(args: {
     Math.round((preferredSlot.end.getTime() - preferredSlot.start.getTime()) / 60000),
   );
 
+  // enrich conflicts with capture details when available
+  const diaGuruConflicts = args.conflicts.filter((c) => c.diaGuru && c.captureId);
+  const captureMap = await loadConflictCaptures(args.admin, diaGuruConflicts);
+  const conflictCaptures = Array.from(captureMap.values()).map((c) => {
+    let facets: any = {};
+    try {
+      const raw = (c as any).scheduling_notes as string | null | undefined;
+      if (raw && typeof raw === 'string' && raw.trim().length > 0) facets = JSON.parse(raw);
+    } catch {}
+    return {
+      id: c.id,
+      content: c.content,
+      estimated_minutes: c.estimated_minutes,
+      constraint_type: c.constraint_type,
+      constraint_time: c.constraint_time,
+      constraint_end: c.constraint_end,
+      constraint_date: c.constraint_date,
+      deadline_at: c.deadline_at,
+      window_start: c.window_start,
+      window_end: c.window_end,
+      start_target_at: c.start_target_at,
+      is_soft_start: c.is_soft_start,
+      reschedule_count: c.reschedule_count,
+      facets,
+    };
+  });
+
   const advisorResult = await adviseWithDeepSeek({
     config: args.llmConfig,
     capture,
     preferredSlot,
     conflicts: args.conflicts,
+    conflictCaptures,
     suggestion: suggestionPayload,
     timezone: args.timezone,
     offsetMinutes: args.offsetMinutes,
@@ -1052,6 +1475,7 @@ async function adviseWithDeepSeek(args: {
   capture: CaptureEntryRow;
   preferredSlot: PreferredSlot;
   conflicts: ConflictSummary[];
+  conflictCaptures: Array<Record<string, unknown>>;
   suggestion: { start: string; end: string } | null;
   timezone: string | null;
   offsetMinutes: number;
@@ -1083,6 +1507,7 @@ async function adviseWithDeepSeek(args: {
     },
     duration_minutes: args.durationMinutes,
     conflicts: args.conflicts,
+    conflict_captures: args.conflictCaptures,
     suggestion: args.suggestion,
     timezone: args.timezone,
     timezone_offset_minutes: args.offsetMinutes,
@@ -1257,35 +1682,76 @@ async function listCalendarEvents(accessToken: string, timeMin: string, timeMax:
   return rawItems as CalendarEvent[];
 }
 
-async function deleteCalendarEvent(accessToken: string, eventId: string) {
+async function getCalendarEvent(accessToken: string, eventId: string) {
   const res = await fetch(`${GOOGLE_EVENTS}/${eventId}`, {
-    method: "DELETE",
+    method: "GET",
     headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (res.status === 404) return null;
+  const payload = await safeParse(res);
+  if (!res.ok) {
+    const message =
+      extractGoogleError(payload) ?? `Failed to fetch calendar event (status ${res.status})`;
+    throw new ScheduleError(message, res.status, payload);
+  }
+  return payload as CalendarEvent;
+}
+
+async function deleteCalendarEvent(
+  accessToken: string,
+  options: { eventId: string; etag?: string | null },
+) {
+  const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+  if (options.etag) headers["If-Match"] = options.etag;
+  const res = await fetch(`${GOOGLE_EVENTS}/${options.eventId}`, {
+    method: "DELETE",
+    headers,
   });
   if (!res.ok) {
     const payload = await safeParse(res);
     const message =
       extractGoogleError(payload) ?? `Failed to delete calendar event (status ${res.status})`;
+    if (res.status === 412) {
+      throw new ScheduleError(message, res.status, { eventId: options.eventId, payload });
+    }
+    if (res.status === 404) return;
     throw new ScheduleError(message, res.status, payload);
   }
 }
 
 async function createCalendarEvent(
   accessToken: string,
-  capture: CaptureEntryRow,
-  slot: { start: Date; end: Date },
+  params: {
+    capture: CaptureEntryRow;
+    slot: { start: Date; end: Date };
+    planId?: string | null;
+    actionId: string;
+    priorityScore: number;
+    description?: string;
+  },
 ) {
+  const { capture, slot, planId, actionId, priorityScore } = params;
   const summary = `[DG] ${capture.content}`.slice(0, 200);
+  const privateProps: Record<string, string> = {
+    diaGuru: "true",
+    capture_id: capture.id,
+    action_id: actionId,
+    priority_snapshot: priorityScore.toFixed(2),
+  };
+  if (planId) {
+    privateProps.plan_id = planId;
+  }
   const body = {
     summary,
-    description: `DiaGuru scheduled task (importance ${capture.importance}).`,
+    description:
+      params.description ??
+      `DiaGuru scheduled task (importance ${capture.importance}).`,
     start: { dateTime: slot.start.toISOString() },
     end: { dateTime: slot.end.toISOString() },
     reminders: { useDefault: true },
     extendedProperties: {
       private: {
-        diaGuru: "true",
-        capture_id: capture.id,
+        ...privateProps,
       },
     },
   };
@@ -1306,13 +1772,75 @@ async function createCalendarEvent(
   }
   const identifier =
     payload && typeof payload === "object" ? (payload as Record<string, unknown>).id : null;
+  const etag =
+    payload && typeof payload === "object" ? (payload as Record<string, unknown>).etag : null;
   if (!identifier || typeof identifier !== "string") {
     throw new ScheduleError("Google did not return an event id", 502, payload);
   }
-  return identifier;
+  return { id: identifier, etag: typeof etag === "string" ? etag : null };
 }
 
-function createGoogleCalendarActions(options: {
+function snapshotFromRow(row: CaptureEntryRow): CaptureSnapshot {
+  return {
+    status: row.status ?? null,
+    planned_start: row.planned_start ?? null,
+    planned_end: row.planned_end ?? null,
+    calendar_event_id: row.calendar_event_id ?? null,
+    calendar_event_etag: row.calendar_event_etag ?? null,
+    freeze_until: row.freeze_until ?? null,
+    plan_id: row.plan_id ?? null,
+  };
+}
+
+function convertPlanActionForInsert(action: PlanActionRecord) {
+  return {
+    plan_id: action.planId,
+    action_id: action.actionId,
+    capture_id: action.captureId,
+    capture_content: action.captureContent,
+    action_type: action.actionType,
+    prev_status: action.prev.status,
+    prev_planned_start: action.prev.planned_start,
+    prev_planned_end: action.prev.planned_end,
+    prev_calendar_event_id: action.prev.calendar_event_id,
+    prev_calendar_event_etag: action.prev.calendar_event_etag,
+    prev_freeze_until: action.prev.freeze_until,
+    prev_plan_id: action.prev.plan_id,
+    next_status: action.next.status,
+    next_planned_start: action.next.planned_start,
+    next_planned_end: action.next.planned_end,
+    next_calendar_event_id: action.next.calendar_event_id,
+    next_calendar_event_etag: action.next.calendar_event_etag,
+    next_freeze_until: action.next.freeze_until,
+    next_plan_id: action.next.plan_id,
+  };
+}
+
+function buildPlanSummary(planId: string, actions: PlanActionRecord[]) {
+  return {
+    id: planId,
+    createdAt: new Date().toISOString(),
+    actions: actions.map((action) => ({
+      actionId: action.actionId,
+      captureId: action.captureId,
+      content: action.captureContent,
+      actionType: action.actionType,
+      previousStart: action.prev.planned_start,
+      previousEnd: action.prev.planned_end,
+      nextStart: action.next.planned_start,
+      nextEnd: action.next.planned_end,
+    })),
+  };
+}
+
+function buildPlanSummaryText(actions: PlanActionRecord[]) {
+  const scheduled = actions.filter((action) => action.actionType === "scheduled").length;
+  const moved = actions.filter((action) => action.actionType === "rescheduled").length;
+  const unscheduled = actions.filter((action) => action.actionType === "unscheduled").length;
+  return `scheduled:${scheduled} moved:${moved} unscheduled:${unscheduled}`;
+}
+
+export function createGoogleCalendarActions(options: {
   credentials: CalendarClientCredentials;
   admin: SupabaseClient<Database, "public">;
   clientId: string;
@@ -1352,8 +1880,9 @@ function createGoogleCalendarActions(options: {
 
   return {
     listEvents: (timeMin, timeMax) => run((token) => listCalendarEvents(token, timeMin, timeMax)),
-    deleteEvent: (eventId) => run((token) => deleteCalendarEvent(token, eventId)),
-    createEvent: (capture, slot) => run((token) => createCalendarEvent(token, capture, slot)),
+    deleteEvent: (options) => run((token) => deleteCalendarEvent(token, options)),
+    createEvent: (options) => run((token) => createCalendarEvent(token, options)),
+    getEvent: (eventId) => run((token) => getCalendarEvent(token, eventId)),
   };
 }
 

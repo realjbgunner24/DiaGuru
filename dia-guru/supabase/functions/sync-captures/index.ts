@@ -4,9 +4,12 @@ import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
+const MANUAL_FREEZE_DURATION_MS = 24 * 60 * 60 * 1000;
 
 type CalendarEvent = {
   id: string;
+  etag?: string;
+  updated?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   summary?: string;
@@ -74,7 +77,7 @@ export async function handler(req: Request) {
     const { data: captureRows } = captureIds.length
       ? await admin
           .from("capture_entries")
-          .select("id, user_id, status, planned_start, planned_end, calendar_event_id")
+          .select("id, user_id, status, planned_start, planned_end, calendar_event_id, calendar_event_etag, freeze_until, manual_touch_at")
           .eq("user_id", userId)
           .in("id", captureIds)
       : { data: [] as CaptureEntryRow[] };
@@ -86,7 +89,7 @@ export async function handler(req: Request) {
 
     const { data: scheduledRows } = await admin
       .from("capture_entries")
-      .select("id, user_id, status, planned_start, planned_end, calendar_event_id")
+      .select("id, user_id, status, planned_start, planned_end, calendar_event_id, calendar_event_etag, freeze_until, manual_touch_at")
       .eq("user_id", userId)
       .eq("status", "scheduled");
 
@@ -97,6 +100,9 @@ export async function handler(req: Request) {
       planned_start: string;
       planned_end: string;
       calendar_event_id: string;
+      calendar_event_etag: string | null;
+      manual_touch_at: string | null;
+      freeze_until: string | null;
     }[] = [];
     const pendingResets: { id: string }[] = [];
 
@@ -110,18 +116,31 @@ export async function handler(req: Request) {
       const capture = capturesById.get(captureId);
       const plannedStart = start.toISOString();
       const plannedEnd = end.toISOString();
-      if (
-        capture &&
-        (capture.planned_start !== plannedStart ||
-          capture.planned_end !== plannedEnd ||
-          capture.calendar_event_id !== event.id ||
-          capture.status !== "scheduled")
-      ) {
+      if (!capture) continue;
+      const eventEtag = typeof event.etag === "string" ? event.etag : null;
+      const startChanged = capture.planned_start !== plannedStart;
+      const endChanged = capture.planned_end !== plannedEnd;
+      const eventIdChanged = capture.calendar_event_id !== event.id;
+      const etagChanged =
+        Boolean(eventEtag) &&
+        Boolean(capture.calendar_event_etag) &&
+        capture.calendar_event_etag !== eventEtag;
+
+      if (startChanged || endChanged || eventIdChanged || etagChanged || capture.status !== "scheduled") {
+        const manualChangeDetected = etagChanged || startChanged || endChanged;
+        const manualTouchAt = manualChangeDetected ? new Date().toISOString() : capture.manual_touch_at ?? null;
+        const freezeUntil = manualChangeDetected
+          ? new Date(Date.now() + MANUAL_FREEZE_DURATION_MS).toISOString()
+          : capture.freeze_until ?? null;
+
         scheduledUpdates.push({
           id: capture.id,
           planned_start: plannedStart,
           planned_end: plannedEnd,
           calendar_event_id: event.id,
+          calendar_event_etag: eventEtag ?? null,
+          manual_touch_at: manualTouchAt,
+          freeze_until: freezeUntil,
         });
       }
     }
@@ -163,6 +182,9 @@ export async function handler(req: Request) {
           planned_start: null,
           planned_end: null,
           calendar_event_id: null,
+          calendar_event_etag: null,
+          manual_touch_at: null,
+          freeze_until: null,
           scheduling_notes: "Google Calendar event missing; returned to queue.",
         })
         .eq("id", reset.id)
