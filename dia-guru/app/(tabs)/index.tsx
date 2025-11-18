@@ -1,6 +1,5 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useSupabaseSession } from '@/hooks/useSupabaseSession';
 import CalendarHealthNotice from '@/components/CalendarHealthNotice';
+import { useSupabaseSession } from '@/hooks/useSupabaseSession';
 import {
   addCapture,
   Capture,
@@ -10,19 +9,23 @@ import {
   invokeScheduleCapture,
   listCaptures,
   listScheduledCaptures,
+  lockCaptureWindow,
   parseCapture,
   ParseMode,
   ParseTaskResponse,
+  PlanSummary,
   ScheduleDecision,
   ScheduleOptions,
   syncCaptureEvents,
+  undoPlan,
 } from '@/lib/capture';
+import { connectGoogleCalendar, getCalendarHealth, type CalendarHealth } from '@/lib/google-connect';
 import {
   cancelScheduledNotification,
   scheduleReminderAt,
 } from '@/lib/notifications';
 import { getAssistantModePreference } from '@/lib/preferences';
-import { connectGoogleCalendar, getCalendarHealth, type CalendarHealth } from '@/lib/google-connect';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -130,7 +133,23 @@ type DerivedConstraint = {
   constraintEnd: string | null;
   constraintDate: string | null;
   originalTargetTime: string | null;
+  deadlineAt: string | null;
+  windowStart: string | null;
+  windowEnd: string | null;
+  startTargetAt: string | null;
+  isSoftStart: boolean;
+  externalityScore: number;
+  taskTypeHint: TaskTypeHint | null;
 };
+
+type TaskTypeHint =
+  | 'deep_work'
+  | 'admin'
+  | 'creative'
+  | 'errand'
+  | 'health'
+  | 'social'
+  | 'collaboration';
 
 const DEADLINE_KEYWORDS = [' due', 'due', 'deadline', 'before', 'submit', 'turn in', 'finish', 'complete', 'overdue'];
 const START_KEYWORDS = [
@@ -160,53 +179,126 @@ const START_KEYWORDS = [
   'rest',
   'meditate',
 ];
+const COLLAB_KEYWORDS = [
+  'meet',
+  'meeting',
+  'call',
+  'zoom',
+  'hangout',
+  'sync',
+  'interview',
+  'pair',
+  'with ',
+  'client',
+  'team',
+  'presentation',
+  'demo',
+  'standup',
+];
+const ADMIN_KEYWORDS = ['email', 'inbox', 'budget', 'file', 'tax', 'expense', 'admin', 'invoice', 'plan', 'review'];
+const CREATIVE_KEYWORDS = ['write', 'draft', 'design', 'brainstorm', 'record', 'edit', 'sketch', 'prototype'];
+const ERRAND_KEYWORDS = ['pickup', 'pick up', 'drop off', 'deliver', 'grocery', 'groceries', 'errand', 'store', 'commute'];
+const HEALTH_KEYWORDS = ['workout', 'run', 'gym', 'yoga', 'meditate', 'doctor', 'dentist', 'therapy', 'rest', 'sleep'];
+const SOCIAL_KEYWORDS = ['dinner', 'lunch', 'date', 'party', 'birthday', 'hangout', 'friends', 'family'];
+const SOFT_START_HINTS = ['around', 'ish', 'about', 'maybe', 'whenever', 'some time', 'sometime', 'after', 'before', 'flexible'];
+const HARD_ANCHOR_KEYWORDS = ['appointment', 'flight', 'depart', 'arrive', 'pickup', 'drop off', 'doctor', 'dentist', 'interview', 'call', 'meeting'];
 
 function deriveConstraintData(
   content: string,
   parseResult: ParseTaskResponse | null,
   _estimatedMinutes: number | null,
 ): DerivedConstraint {
+  const lowerContent = content.toLowerCase();
+  const classification = classifyTaskType(lowerContent);
   const defaults: DerivedConstraint = {
     constraintType: 'flexible',
     constraintTime: null,
     constraintEnd: null,
     constraintDate: null,
     originalTargetTime: null,
+    deadlineAt: null,
+    windowStart: null,
+    windowEnd: null,
+    startTargetAt: null,
+    isSoftStart: false,
+    externalityScore: classification.externalityScore,
+    taskTypeHint: classification.taskTypeHint,
   };
   if (!parseResult) return defaults;
 
   const structured = parseResult.structured ?? {};
-  const lowerContent = content.toLowerCase();
-  const hasDeadlineKeyword = DEADLINE_KEYWORDS.some((keyword) => lowerContent.includes(keyword));
-  const hasStartKeyword = START_KEYWORDS.some((keyword) => lowerContent.includes(keyword));
+
+  // Prefer rich capture mapping if provided by parse-task
+  const cap = structured.capture as
+    | {
+        constraint_type?: 'flexible' | 'deadline_time' | 'deadline_date' | 'start_time' | 'window';
+        constraint_time?: string | null;
+        constraint_end?: string | null;
+        constraint_date?: string | null;
+        original_target_time?: string | null;
+        deadline_at?: string | null;
+        window_start?: string | null;
+        window_end?: string | null;
+        start_target_at?: string | null;
+        is_soft_start?: boolean;
+        task_type_hint?: TaskTypeHint | null;
+      }
+    | undefined;
+  if (cap && cap.constraint_type) {
+    return {
+      ...defaults,
+      constraintType: cap.constraint_type,
+      constraintTime: cap.constraint_time ?? null,
+      constraintEnd: cap.constraint_end ?? null,
+      constraintDate: cap.constraint_date ?? null,
+      originalTargetTime: cap.original_target_time ?? null,
+      deadlineAt: cap.deadline_at ?? null,
+      windowStart: cap.window_start ?? null,
+      windowEnd: cap.window_end ?? null,
+      startTargetAt: cap.start_target_at ?? null,
+      isSoftStart: Boolean(cap.is_soft_start),
+      taskTypeHint: (cap.task_type_hint as TaskTypeHint | null) ?? classification.taskTypeHint,
+    };
+  }
+  const hasDeadlineKeyword = containsKeyword(lowerContent, DEADLINE_KEYWORDS);
+  const hasStartKeyword = containsKeyword(lowerContent, START_KEYWORDS);
 
   const window = structured.window;
   if (window?.start && window?.end) {
     return {
+      ...defaults,
       constraintType: 'window',
       constraintTime: window.start,
       constraintEnd: window.end,
       constraintDate: null,
       originalTargetTime: window.end ?? window.start ?? null,
+      windowStart: window.start ?? null,
+      windowEnd: window.end ?? null,
+      deadlineAt: window.end ?? null,
     };
   }
   if (window?.start) {
     if (!window.start) return defaults;
     return {
+      ...defaults,
       constraintType: 'start_time',
       constraintTime: window.start,
       constraintEnd: null,
       constraintDate: null,
       originalTargetTime: window.start,
+      startTargetAt: window.start,
+      isSoftStart: inferSoftStart(lowerContent),
     };
   }
   if (window?.end) {
     return {
+      ...defaults,
       constraintType: 'deadline_time',
       constraintTime: window.end,
       constraintEnd: null,
       constraintDate: null,
       originalTargetTime: window.end,
+      deadlineAt: window.end,
     };
   }
 
@@ -220,11 +312,13 @@ function deriveConstraintData(
 
   if (hasDeadlineKeyword && hasExplicitTime) {
     return {
+      ...defaults,
       constraintType: 'deadline_time',
       constraintTime: datetime,
       constraintEnd: null,
       constraintDate: null,
       originalTargetTime: datetime,
+      deadlineAt: datetime,
     };
   }
 
@@ -232,11 +326,13 @@ function deriveConstraintData(
     const date = datetime.slice(0, 10);
     const endOfDay = buildEndOfDayIso(datetime);
     return {
+      ...defaults,
       constraintType: 'deadline_date',
       constraintTime: null,
       constraintEnd: null,
       constraintDate: date,
       originalTargetTime: endOfDay,
+      deadlineAt: endOfDay,
     };
   }
 
@@ -245,28 +341,35 @@ function deriveConstraintData(
       const date = datetime.slice(0, 10);
       const endOfDay = buildEndOfDayIso(datetime);
       return {
+        ...defaults,
         constraintType: 'deadline_date',
         constraintTime: null,
         constraintEnd: null,
         constraintDate: date,
         originalTargetTime: endOfDay,
+        deadlineAt: endOfDay,
       };
     }
     return {
+      ...defaults,
       constraintType: 'start_time',
       constraintTime: datetime,
       constraintEnd: null,
       constraintDate: null,
       originalTargetTime: datetime,
+      startTargetAt: datetime,
+      isSoftStart: inferSoftStart(lowerContent),
     };
   }
 
   return {
+    ...defaults,
     constraintType: 'deadline_time',
     constraintTime: datetime,
     constraintEnd: null,
     constraintDate: null,
     originalTargetTime: datetime,
+    deadlineAt: datetime,
   };
 }
 
@@ -275,6 +378,62 @@ function buildEndOfDayIso(datetime: string) {
   if (Number.isNaN(date.getTime())) return null;
   date.setHours(23, 59, 0, 0);
   return date.toISOString();
+}
+
+function containsKeyword(content: string, keywords: string[]) {
+  return keywords.some((keyword) => {
+    const trimmed = keyword.trim();
+    if (!trimmed) return false;
+    const hasInternalWhitespace = /\s/.test(trimmed);
+    const requiresLeadingWhitespace = keyword.startsWith(' ');
+    const requiresTrailingWhitespace = keyword.endsWith(' ');
+    const startBoundary = requiresLeadingWhitespace ? '(?:^|\\s)' : '\\b';
+    const endBoundary = requiresTrailingWhitespace ? '(?:\\s|$)' : '\\b';
+
+    if (hasInternalWhitespace) {
+      const pattern = new RegExp(
+        `${requiresLeadingWhitespace ? '(?:^|\\s)' : ''}${escapeRegex(trimmed)}${requiresTrailingWhitespace ? '(?:\\s|$)' : ''}`,
+        'i',
+      );
+      return pattern.test(content);
+    }
+
+    const pattern = new RegExp(`${startBoundary}${escapeRegex(trimmed)}${endBoundary}`, 'i');
+    return pattern.test(content);
+  });
+}
+
+function classifyTaskType(content: string): { taskTypeHint: TaskTypeHint | null; externalityScore: number } {
+  if (containsKeyword(content, COLLAB_KEYWORDS)) {
+    return { taskTypeHint: 'collaboration', externalityScore: 3 };
+  }
+  if (containsKeyword(content, SOCIAL_KEYWORDS)) {
+    return { taskTypeHint: 'social', externalityScore: 2 };
+  }
+  if (containsKeyword(content, ERRAND_KEYWORDS)) {
+    return { taskTypeHint: 'errand', externalityScore: 1 };
+  }
+  if (containsKeyword(content, HEALTH_KEYWORDS)) {
+    return { taskTypeHint: 'health', externalityScore: 1 };
+  }
+  if (containsKeyword(content, ADMIN_KEYWORDS)) {
+    return { taskTypeHint: 'admin', externalityScore: 1 };
+  }
+  if (containsKeyword(content, CREATIVE_KEYWORDS)) {
+    return { taskTypeHint: 'creative', externalityScore: 0 };
+  }
+  return { taskTypeHint: 'deep_work', externalityScore: containsKeyword(content, DEADLINE_KEYWORDS) ? 1 : 0 };
+}
+
+function inferSoftStart(content: string) {
+  const hasSoftLanguage = containsKeyword(content, SOFT_START_HINTS);
+  const hasHardAnchor = containsKeyword(content, HARD_ANCHOR_KEYWORDS);
+  if (hasSoftLanguage && !hasHardAnchor) return true;
+  return false;
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export default function HomeTab() {
@@ -310,6 +469,9 @@ export default function HomeTab() {
   const [calendarHealth, setCalendarHealth] = useState<CalendarHealth | null>(null);
   const [calendarHealthError, setCalendarHealthError] = useState<string | null>(null);
   const [calendarHealthChecking, setCalendarHealthChecking] = useState(false);
+  const [recentPlan, setRecentPlan] = useState<PlanSummary | null>(null);
+  const [undoingPlan, setUndoingPlan] = useState(false);
+  const [lockingCaptureId, setLockingCaptureId] = useState<string | null>(null);
 
 
   const [refreshing, setRefreshing] = useState(false);
@@ -516,6 +678,9 @@ export default function HomeTab() {
           ...(options ?? {}),
         });
         await Promise.all([loadPending(), loadScheduled()]);
+        if (response?.planSummary) {
+          setRecentPlan(response.planSummary);
+        }
         await refreshCalendarHealth();
         return response;
       } catch (error) {
@@ -534,6 +699,74 @@ export default function HomeTab() {
     [loadPending, loadScheduled, pending, refreshCalendarHealth, timezone, timezoneOffsetMinutes, userId],
   );
 
+  const scheduleEntireQueue = useCallback(async () => {
+    if (!userId) return null;
+    if (autoSchedulingRef.current) return null;
+    autoSchedulingRef.current = true;
+    try {
+      setScheduling(true);
+      // Fetch the latest pending list (ranked)
+      const queue = await loadPending();
+      let scheduledCount = 0;
+      for (const cap of queue) {
+        try {
+          const resp = await invokeScheduleCapture(cap.id, 'schedule', {
+            timezone,
+            timezoneOffsetMinutes,
+          });
+          let scheduled = !resp?.decision;
+
+          // If server returns a conflict decision with a suggestion, try suggested slot first
+          const suggestion = resp?.decision?.suggestion ?? null;
+          if (!scheduled && suggestion) {
+            const follow = await invokeScheduleCapture(cap.id, 'schedule', {
+              preferredStart: suggestion.start,
+              preferredEnd: suggestion.end,
+              timezone,
+              timezoneOffsetMinutes,
+            });
+            scheduled = !follow?.decision;
+            // If still not scheduled, allow overlap with suggested slot
+            if (!scheduled) {
+              const overlapFollow = await invokeScheduleCapture(cap.id, 'schedule', {
+                preferredStart: suggestion.start,
+                preferredEnd: suggestion.end,
+                allowOverlap: true,
+                timezone,
+                timezoneOffsetMinutes,
+              });
+              scheduled = !overlapFollow?.decision;
+            }
+          }
+
+          // If no suggestion or still not scheduled, attempt overlap without a preferred slot
+          if (!scheduled && !suggestion) {
+            const overlapResp = await invokeScheduleCapture(cap.id, 'schedule', {
+              allowOverlap: true,
+              timezone,
+              timezoneOffsetMinutes,
+            });
+            scheduled = !overlapResp?.decision;
+          }
+
+          if (scheduled) scheduledCount += 1;
+          // Refresh lists incrementally to keep busy intervals consistent server-side
+          await Promise.all([loadPending(), loadScheduled()]);
+        } catch (e) {
+          // Skip problematic capture; continue with the rest
+          // eslint-disable-next-line no-console
+          console.log('queue scheduling error', cap.id, e);
+          continue;
+        }
+      }
+      await refreshCalendarHealth();
+      return scheduledCount;
+    } finally {
+      setScheduling(false);
+      autoSchedulingRef.current = false;
+    }
+  }, [loadPending, loadScheduled, refreshCalendarHealth, timezone, timezoneOffsetMinutes, userId]);
+
   const finalizeCapture = useCallback(
     async (
       content: string,
@@ -547,16 +780,54 @@ export default function HomeTab() {
 
       const constraint = deriveConstraintData(content, parseResult, estimatedMinutes);
 
+      // Prefer LLM-provided importance if available
+      const extraction = parseResult?.structured?.extraction as any | null;
+      const llmUrgency: number | null = extraction?.importance?.urgency ?? null;
+      const llmImpact: number | null = extraction?.importance?.impact ?? null;
+      const llmCompositeImportance =
+        llmUrgency != null || llmImpact != null
+          ? Math.max(1, Math.round(((llmUrgency ?? 0) * 0.6 + (llmImpact ?? 0) * 0.4)))
+          : selectedImportance;
+      // Map LLM 1–5 scale to DB 1–3 scale to satisfy capture_entries_importance_check
+      const mappedImportance =
+        llmCompositeImportance <= 2 ? 1 : llmCompositeImportance >= 5 ? 3 : 2;
+
+      // Persist rich facets in scheduling_notes for server-side policy
+      const schedulingNotes = extraction
+        ? JSON.stringify({ importance: extraction.importance ?? null, flexibility: extraction.flexibility ?? null })
+        : null;
+
       const created = await addCapture(
         {
           content,
           estimatedMinutes,
-          importance: selectedImportance,
+          importance: mappedImportance,
+          urgency: llmUrgency,
+          impact: llmImpact,
+          reschedulePenalty: extraction?.importance?.reschedule_penalty ?? null,
+          blocking: extraction?.importance?.blocking ?? null,
+          cannotOverlap: extraction?.flexibility?.cannot_overlap ?? null,
+          startFlexibility: extraction?.flexibility?.start_flexibility ?? null,
+          durationFlexibility: extraction?.flexibility?.duration_flexibility ?? null,
+          minChunkMinutes: extraction?.flexibility?.min_chunk_minutes ?? null,
+          maxSplits: extraction?.flexibility?.max_splits ?? null,
+          extractionKind: extraction?.kind ?? null,
+          timePrefTimeOfDay: extraction?.time_preferences?.time_of_day ?? null,
+          timePrefDay: extraction?.time_preferences?.day ?? null,
+          importanceRationale: extraction?.importance?.rationale ?? null,
+          schedulingNotes,
           constraintType: constraint.constraintType,
           constraintTime: constraint.constraintTime,
           constraintEnd: constraint.constraintEnd,
           constraintDate: constraint.constraintDate,
           originalTargetTime: constraint.originalTargetTime,
+          deadlineAt: constraint.deadlineAt,
+          windowStart: constraint.windowStart,
+          windowEnd: constraint.windowEnd,
+          startTargetAt: constraint.startTargetAt,
+          isSoftStart: constraint.isSoftStart,
+          externalityScore: constraint.externalityScore,
+          taskTypeHint: constraint.taskTypeHint,
         },
         userId,
       );
@@ -578,6 +849,40 @@ export default function HomeTab() {
       Alert.alert('Reconnect failed', 'Unable to open Google sign-in right now. Please try again.');
     });
   }, []);
+
+  const dismissPlanSummary = useCallback(() => {
+    setRecentPlan(null);
+  }, []);
+
+  const handlePlanUndo = useCallback(async () => {
+    if (!recentPlan || undoingPlan) return;
+    setUndoingPlan(true);
+    try {
+      await undoPlan(recentPlan.id);
+      setRecentPlan(null);
+      await Promise.all([loadPending(), loadScheduled()]);
+    } catch (error) {
+      Alert.alert('Undo failed', extractScheduleError(error));
+    } finally {
+      setUndoingPlan(false);
+    }
+  }, [loadPending, loadScheduled, recentPlan, undoingPlan]);
+
+  const handleLockCapture = useCallback(
+    async (captureId: string) => {
+      if (lockingCaptureId) return;
+      setLockingCaptureId(captureId);
+      try {
+        await lockCaptureWindow(captureId);
+        await loadScheduled();
+      } catch (error) {
+        Alert.alert('Lock failed', extractScheduleError(error));
+      } finally {
+        setLockingCaptureId(null);
+      }
+    },
+    [loadScheduled, lockingCaptureId],
+  );
 
   const attemptSchedule = useCallback(
     async (captureId: string) => {
@@ -620,55 +925,23 @@ export default function HomeTab() {
       return;
     }
 
-    const nextAppended = [...pendingCapture.appended, answer];
-
     try {
       setSubmitting(true);
 
       let resolvedMinutes: number | null = null;
-      let latestParse: ParseTaskResponse | null = null;
-
-      try {
-        latestParse = await parseCapture({
-          text: [pendingCapture.baseContent, ...nextAppended].join('\n'),
-          mode: pendingCapture.mode,
-          timezone,
-          now: new Date().toISOString(),
-        });
-        const candidate = latestParse.structured?.estimated_minutes;
-        if (typeof candidate === 'number' && candidate > 0) {
-          resolvedMinutes = candidate;
-        } else if (latestParse.follow_up) {
-          setPendingCapture({
-            baseContent: pendingCapture.baseContent,
-            importance: pendingCapture.importance,
-            appended: nextAppended,
-            mode: pendingCapture.mode,
-          });
-          setFollowUpState({
-            prompt: latestParse.follow_up.prompt,
-            missing: latestParse.follow_up.missing ?? [],
-          });
-          setFollowUpAnswer('');
-          setSubmitting(false);
-          return;
-        }
-      } catch (error) {
-        console.log('follow-up parse failed', error);
-      }
-
-      if (resolvedMinutes === null) {
-        const numericMatch = answer.match(/(\d+(?:\.\d+)?)/);
-        if (numericMatch) {
-          const numeric = Number(numericMatch[1]);
-          if (!Number.isNaN(numeric) && numeric > 0) {
-            resolvedMinutes = Math.round(numeric);
-          }
+      const numericMatch = answer.match(/(\d+(?:\.\d+)?)/);
+      if (numericMatch) {
+        const numeric = Number(numericMatch[1]);
+        if (!Number.isNaN(numeric) && numeric > 0) {
+          resolvedMinutes = Math.round(numeric);
         }
       }
 
       if (resolvedMinutes === null) {
-        Alert.alert('Need a duration', 'Please provide the estimated minutes (for example, 45).');
+        Alert.alert(
+          'Unable to parse answer',
+          'Please reply with a number of minutes (for example, 45).',
+        );
         setSubmitting(false);
         return;
       }
@@ -677,7 +950,7 @@ export default function HomeTab() {
         pendingCapture.baseContent,
         resolvedMinutes,
         pendingCapture.importance,
-        latestParse,
+        null,
       );
 
       setFollowUpState(null);
@@ -690,7 +963,7 @@ export default function HomeTab() {
     } finally {
       setSubmitting(false);
     }
-  }, [attemptSchedule, finalizeCapture, followUpAnswer, followUpState, pendingCapture, timezone]);
+  }, [attemptSchedule, finalizeCapture, followUpAnswer, followUpState, pendingCapture]);
 
   const handleAddCapture = useCallback(async () => {
     if (!userId) {
@@ -725,10 +998,9 @@ export default function HomeTab() {
       let parseResult: ParseTaskResponse | null = null;
 
       try {
-        const parseMode: ParseMode = hasMinutes ? 'deterministic' : mode;
         parseResult = await parseCapture({
           text: content,
-          mode: parseMode,
+          mode,
           timezone,
           now: new Date().toISOString(),
         });
@@ -736,10 +1008,8 @@ export default function HomeTab() {
         if (!hasMinutes) {
           const message =
             error instanceof Error ? error.message : 'We could not infer the duration automatically.';
-          Alert.alert(
-            'Need a duration',
-            `${message}\n\nPlease enter an estimated number of minutes so DiaGuru can schedule this.`,
-          );
+          Alert.alert('DeepSeek failed', message);
+
           setSubmitting(false);
           return;
         }
@@ -749,7 +1019,7 @@ export default function HomeTab() {
         const candidate = parseResult?.structured?.estimated_minutes;
         if (typeof candidate === 'number' && candidate > 0) {
           resolvedMinutes = candidate;
-        } else if (mode === 'conversational' && parseResult?.follow_up) {
+        } else if (parseResult?.follow_up) {
           setPendingCapture({
             baseContent: content,
             importance,
@@ -764,19 +1034,17 @@ export default function HomeTab() {
           setSubmitting(false);
           return;
         } else {
-          const prompt =
-            parseResult?.follow_up?.prompt ?? 'About how many minutes do you expect this to take?';
-          Alert.alert('Need a duration', prompt);
+          Alert.alert(
+            'DeepSeek failed',
+            'DeepSeek did not provide a clarifying question in conversational strict mode.',
+          );
           setSubmitting(false);
           return;
         }
       }
 
       if (resolvedMinutes === null) {
-        Alert.alert(
-          'Need a duration',
-          'Please enter an estimated number of minutes so DiaGuru can schedule this.',
-        );
+        Alert.alert('DeepSeek failed', 'DeepSeek could not infer a duration from your capture.');
         setSubmitting(false);
         return;
       }
@@ -827,6 +1095,8 @@ export default function HomeTab() {
           await invokeCaptureCompletion(capture.id, 'complete');
         } else if (action === 'reschedule') {
           await invokeCaptureCompletion(capture.id, 'reschedule');
+          // Immediately try to schedule this capture again
+          await scheduleTopCapture(capture.id, 'schedule');
         }
         await Promise.all([loadPending(), loadScheduled()]);
       } catch (error: any) {
@@ -835,7 +1105,7 @@ export default function HomeTab() {
         setActionCaptureId(null);
       }
     },
-    [loadPending, loadScheduled, userId],
+    [loadPending, loadScheduled, scheduleTopCapture, userId],
   );
 
   const captureForm = (
@@ -914,7 +1184,7 @@ export default function HomeTab() {
             <Text style={styles.sectionSubtitle}>Queue (ranked)</Text>
             <TouchableOpacity
               disabled={scheduling || pending.length === 0}
-              onPress={() => scheduleTopCapture(undefined, 'reschedule')}
+              onPress={() => scheduleEntireQueue()}
               style={[
                 styles.secondaryButton,
                 (scheduling || pending.length === 0) && styles.primaryButtonDisabled,
@@ -1006,6 +1276,16 @@ export default function HomeTab() {
             onReconnect={handleReconnectCalendar}
             onRetry={refreshCalendarHealth}
           />
+          {recentPlan && recentPlan.actions.length > 0 ? (
+            <TodayChangedCard
+              plan={recentPlan}
+              onDismiss={dismissPlanSummary}
+              onUndo={handlePlanUndo}
+              undoing={undoingPlan}
+              onLock={handleLockCapture}
+              lockingCaptureId={lockingCaptureId}
+            />
+          ) : null}
           {captureForm}
           {scheduledSection}
         </ScrollView>
@@ -1022,8 +1302,8 @@ export default function HomeTab() {
           style={styles.followUpBackdrop}
         >
           <View style={styles.followUpCard}>
-            <Text style={styles.followUpTitle}>Need a detail</Text>
-            <Text style={styles.followUpPrompt}>{followUpState?.prompt ?? 'Could you share the missing detail?'}</Text>
+            <Text style={styles.followUpTitle}>DeepSeek asks</Text>
+            <Text style={styles.followUpPrompt}>{followUpState?.prompt ?? 'Please answer the assistant\u2019s question.'}</Text>
             {followUpState?.missing?.length ? (
               <Text style={styles.followUpHint}>Missing: {followUpState.missing.join(', ')}</Text>
             ) : null}
@@ -1031,7 +1311,7 @@ export default function HomeTab() {
               style={styles.followUpInput}
               value={followUpAnswer}
               onChangeText={setFollowUpAnswer}
-              placeholder="It should take about 45 minutes..."
+              placeholder="Type your answer..."
               placeholderTextColor="#9CA3AF"
               autoFocus
               editable={!submitting}
@@ -1136,10 +1416,139 @@ function ScheduledSummaryCard({ capture }: { capture: Capture }) {
   );
 }
 
+type TodayChangedCardProps = {
+  plan: PlanSummary;
+  onDismiss: () => void;
+  onUndo: () => void;
+  undoing: boolean;
+  onLock: (captureId: string) => void;
+  lockingCaptureId: string | null;
+};
+
+function TodayChangedCard({
+  plan,
+  onDismiss,
+  onUndo,
+  undoing,
+  onLock,
+  lockingCaptureId,
+}: TodayChangedCardProps) {
+  return (
+    <View style={styles.todayCard}>
+      <View style={styles.todayCardHeader}>
+        <Text style={styles.todayCardTitle}>Today changed</Text>
+        <TouchableOpacity onPress={onDismiss}>
+          <Text style={styles.todayCardDismiss}>Dismiss</Text>
+        </TouchableOpacity>
+      </View>
+      <Text style={styles.todayCardSubtitle}>
+        {`DiaGuru adjusted ${plan.actions.length} ${plan.actions.length === 1 ? 'session' : 'sessions'}.`}
+      </Text>
+      {plan.actions.map((action) => (
+        <View key={action.actionId} style={styles.todayActionRow}>
+          <Text style={styles.todayActionLabel}>{describePlanAction(action)}</Text>
+          <TouchableOpacity
+            style={[styles.todayLockButton, lockingCaptureId === action.captureId && styles.todayLockButtonDisabled]}
+            onPress={() => onLock(action.captureId)}
+            disabled={lockingCaptureId === action.captureId}
+          >
+            <Text style={styles.todayLockButtonText}>
+              {lockingCaptureId === action.captureId ? 'Locking…' : 'Lock'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      ))}
+      <View style={styles.todayCardButtons}>
+        <TouchableOpacity style={styles.todaySecondaryButton} onPress={onDismiss}>
+          <Text style={styles.todaySecondaryButtonText}>Got it</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.todayPrimaryButton, undoing && styles.todayPrimaryButtonDisabled]}
+          onPress={onUndo}
+          disabled={undoing}
+        >
+          <Text style={styles.todayPrimaryButtonText}>{undoing ? 'Undoing…' : 'Undo plan'}</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+function describePlanAction(action: PlanSummary['actions'][number]) {
+  const timeText = formatPlanRange(action.nextStart, action.nextEnd);
+  const previousText = formatPlanRange(action.previousStart, action.previousEnd);
+  if (action.actionType === 'scheduled') {
+    return `Scheduled “${action.content}” for ${timeText}`;
+  }
+  if (action.actionType === 'rescheduled') {
+    return `Moved “${action.content}” to ${timeText}`;
+  }
+  return `Unscheduled “${action.content}” (was ${previousText})`;
+}
+
+function formatPlanRange(start: string | null, end: string | null) {
+  if (!start) return 'unscheduled';
+  const startText = formatPlanTime(start);
+  const endText = end ? formatPlanTime(end) : '';
+  return endText ? `${startText} → ${endText}` : startText;
+}
+
+function formatPlanTime(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return 'unknown time';
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#F3F4F6' },
   scroll: { flex: 1 },
   scrollContent: { paddingHorizontal: 16, paddingBottom: 32, gap: 24 },
+  todayCard: {
+    backgroundColor: '#EEF2FF',
+    borderRadius: 16,
+    padding: 16,
+    gap: 12,
+  },
+  todayCardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  todayCardTitle: { fontSize: 16, fontWeight: '700', color: '#111827' },
+  todayCardDismiss: { color: '#64748B', fontWeight: '600' },
+  todayCardSubtitle: { color: '#1F2937' },
+  todayActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  todayActionLabel: { flex: 1, color: '#111827', fontSize: 14 },
+  todayLockButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+  },
+  todayLockButtonDisabled: { opacity: 0.5 },
+  todayLockButtonText: { color: '#4338CA', fontWeight: '600', fontSize: 12 },
+  todayCardButtons: { flexDirection: 'row', gap: 12, marginTop: 4 },
+  todaySecondaryButton: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#CBD5F5',
+    backgroundColor: '#fff',
+  },
+  todaySecondaryButtonText: { fontWeight: '600', color: '#1F2937' },
+  todayPrimaryButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#4338CA',
+    alignItems: 'center',
+  },
+  todayPrimaryButtonDisabled: { opacity: 0.5 },
+  todayPrimaryButtonText: { color: '#fff', fontWeight: '700' },
   captureSection: {
     backgroundColor: '#fff',
     borderRadius: 12,

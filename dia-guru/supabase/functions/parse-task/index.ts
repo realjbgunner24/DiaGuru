@@ -1,4 +1,4 @@
-type ParseMode = "deterministic" | "conversational";
+type ParseMode = "conversational_strict";
 
 type ParseRequest = {
   text?: string;
@@ -10,13 +10,24 @@ type ParseRequest = {
 type ParseResponse = {
   content: string;
   structured: {
+    // Back-compat simple fields
     estimated_minutes?: number;
     datetime?: string;
-    window?: { start: string; end: string };
+    window?: { start?: string; end?: string };
+
+    // Rich extraction payload
+    extraction?: DiaGuruTaskExtraction;
+
+    // Recommended capture fields for scheduler
+    capture?: Partial<CaptureMapping> & { reason?: string };
   };
   notes: string[];
   needed: string[];
   mode: ParseMode;
+  debug?: {
+    deepseek_raw?: string;
+    deepseek_payload_excerpt?: string;
+  };
   follow_up?: {
     type: "clarify";
     prompt: string;
@@ -39,30 +50,68 @@ type ParseResponse = {
   };
 };
 
-type DucklingItem = {
-  dim?: string;
-  entity?: string;
-  body?: string;
-  start?: number;
-  end?: number;
-  value?: Record<string, unknown>;
+// Rich extraction types (aligned with test-deepseek)
+type DiaGuruTaskExtraction = {
+  title: string | null;
+  estimated_minutes: number | null;
+  deadline: { datetime: string | null; kind: "hard" | "soft" | null; source: "explicit" | "inferred" | null } | null;
+  scheduled_time: { datetime: string | null; precision: "exact" | "approximate" | null; source: "explicit" | "inferred" | null } | null;
+  execution_window: {
+    relation:
+      | "before_deadline"
+      | "after_deadline"
+      | "around_scheduled"
+      | "between"
+      | "on_day"
+      | "anytime"
+      | null;
+    start: string | null;
+    end: string | null;
+    source: "explicit" | "inferred" | "default" | null;
+  } | null;
+  time_preferences: { time_of_day: "morning" | "afternoon" | "evening" | "night" | null; day: "today" | "tomorrow" | "specific_date" | "any" | null } | null;
+  importance?: {
+    urgency: 1 | 2 | 3 | 4 | 5;
+    impact: 1 | 2 | 3 | 4 | 5;
+    reschedule_penalty: 0 | 1 | 2 | 3;
+    blocking: boolean;
+    rationale: string;
+  } | null;
+  flexibility?: {
+    cannot_overlap: boolean;
+    start_flexibility: "hard" | "soft" | "anytime";
+    duration_flexibility: "fixed" | "split_allowed";
+    min_chunk_minutes: number | null;
+    max_splits: number | null;
+  } | null;
+  kind?: "task" | "appointment" | "call" | "meeting" | "study" | "errand" | "other" | null;
+  missing: string[];
+  clarifying_question: string | null;
+  notes: string[];
 };
 
-type DurationCandidate = {
-  minutes: number;
-  source: string;
+// Fields we recommend to persist onto capture_entries
+type CaptureMapping = {
+  estimated_minutes: number | null;
+  constraint_type: "flexible" | "deadline_time" | "deadline_date" | "start_time" | "window";
+  constraint_time: string | null;
+  constraint_end: string | null;
+  constraint_date: string | null;
+  original_target_time: string | null;
+  deadline_at: string | null;
+  window_start: string | null;
+  window_end: string | null;
+  start_target_at: string | null;
+  is_soft_start: boolean;
+  task_type_hint: string | null;
 };
-
-type TemporalCandidate =
-  | { type: "value"; iso: string; source: string }
-  | { type: "interval"; from?: string; to?: string; source: string };
 
 const DEFAULT_TIMEZONE = "UTC";
 
 export async function handler(req: Request) {
   try {
     const body = (await safeParseBody(req)) as ParseRequest;
-    const mode = body.mode ?? "deterministic";
+    const mode: ParseMode = "conversational_strict";
     const content = (body.text ?? "").trim();
     if (!content) {
       return json(
@@ -74,157 +123,180 @@ export async function handler(req: Request) {
     }
 
     const timezone = (body.timezone ?? DEFAULT_TIMEZONE).trim() || DEFAULT_TIMEZONE;
-    const now = body.now ? new Date(body.now) : new Date();
-    if (Number.isNaN(now.getTime())) {
-      return json({ error: "Invalid now timestamp" }, 400);
-    }
-
-    const ducklingEnabled = Boolean(Deno.env.get("DUCKLING_URL"));
     const deepseekApiKey = Deno.env.get("DEEPSEEK_API_KEY") ?? "";
     const deepseekEnabled = deepseekApiKey.length > 0;
+
     const notes: string[] = [];
     const heuristics: string[] = [];
 
-    let ducklingLatency: number | undefined;
-    let ducklingErrored = false;
-    let deepseekAttempted = false;
-    let deepseekLatency: number | undefined;
-    let deepseekErrored = false;
-    let deepseekUsedFallback = false;
-    let followUp: ParseResponse["follow_up"];
-    let ducklingItems: DucklingItem[] = [];
-    if (ducklingEnabled) {
-      const started = performance.now();
-      try {
-        ducklingItems = await callDuckling(content, timezone, now);
-        ducklingLatency = Math.round(performance.now() - started);
-        if (ducklingItems.length === 0) {
-          notes.push("Duckling returned no results.");
-        }
-      } catch (error) {
-        ducklingErrored = true;
-        notes.push(describeError("Duckling request failed", error));
-      }
-    } else {
-      notes.push("Duckling disabled (DUCKLING_URL not set).");
-    }
-
-    let duration = pickDurationFromDuckling(ducklingItems);
-    if (duration) {
-      heuristics.push("duckling-duration");
-    } else {
-      const regexDuration = pickDurationFromRegex(content);
-      if (regexDuration) {
-        heuristics.push("regex-duration");
-        duration = regexDuration;
-      }
-    }
-    if (duration) {
-      notes.push(`Estimated duration ${duration.minutes} minutes (source: ${duration.source}).`);
-    }
-
-    const timeCandidate = pickTemporalFromDuckling(ducklingItems);
-    let ambiguousTimeSnippet: string | null = null;
-    if (timeCandidate && timeCandidate.type === "value") {
-      ambiguousTimeSnippet = detectAmbiguousMeridiemSnippet(
-        timeCandidate.source ?? "",
-        content,
+    if (!deepseekEnabled) {
+      const detail = "DeepSeek is required in conversational_strict mode (DEEPSEEK_API_KEY missing).";
+      notes.push(detail);
+      return json(
+        {
+          error: "DeepSeek not configured",
+          details: detail,
+          notes,
+        },
+        500,
       );
-      if (ambiguousTimeSnippet) {
-        notes.push(`Time "${ambiguousTimeSnippet}" is missing an AM/PM indicator.`);
-      }
-    }
-    if (timeCandidate) {
-      heuristics.push("duckling-time");
-      if (timeCandidate.type === "value" && timeCandidate.iso) {
-        notes.push(`Detected time constraint (${timeCandidate.iso}) from "${timeCandidate.source}".`);
-      } else if (timeCandidate.type === "interval") {
-        const windows: string[] = [];
-        if (timeCandidate.from) windows.push(`from ${timeCandidate.from}`);
-        if (timeCandidate.to) windows.push(`to ${timeCandidate.to}`);
-        notes.push(`Detected interval ${windows.join(" ")} from "${timeCandidate.source}".`.trim());
-      }
-    }
-
-    const structured: ParseResponse["structured"] = {
-      estimated_minutes: duration?.minutes,
-    };
-    if (timeCandidate) {
-      if (timeCandidate.type === "value" && timeCandidate.iso) {
-        if (!ambiguousTimeSnippet) {
-          structured.datetime = timeCandidate.iso;
-        }
-      } else if (timeCandidate.type === "interval") {
-        const { from, to } = timeCandidate;
-        if (from && to) {
-          structured.window = { start: from, end: to };
-        } else if (from || to) {
-          structured.datetime = from ?? to;
-        }
-      }
     }
 
     const needed: string[] = [];
-    if (!structured.estimated_minutes) {
-      needed.push("estimated_minutes");
-    }
-    if (ambiguousTimeSnippet && !needed.includes("time_meridiem")) {
-      needed.push("time_meridiem");
-    }
 
-    if (needed.length > 0 && mode === "conversational") {
-      const clarifyingContext = { ambiguousTime: ambiguousTimeSnippet ?? undefined };
-      if (deepseekEnabled) {
-        deepseekAttempted = true;
-        const started = performance.now();
-        try {
-          const question = await requestDeepSeekClarification({
-            apiKey: deepseekApiKey,
-            content,
-            needed,
-            structured,
-            timezone,
-            context: clarifyingContext,
+    let deepseekAttempted = false;
+    let deepseekLatency: number | undefined;
+    let deepseekErrored = false;
+    let followUp: ParseResponse["follow_up"];
+
+    let extraction: DiaGuruTaskExtraction | null = null;
+    let captureProposal: CaptureMapping | null = null;
+    let lastRawMessage: string | null = null;
+    let lastPayload: unknown = null;
+
+    try {
+      deepseekAttempted = true;
+      const started = performance.now();
+      const { systemPrompt, userPrompt } = buildExtractionPrompts({ content, timezone });
+
+      const rawEndpoint = Deno.env.get("DEEPSEEK_API_URL");
+      const endpoint = !rawEndpoint || rawEndpoint.trim() === ""
+        ? "https://api.deepseek.com/v1/chat/completions"
+        : /\/chat\/completions\/?$/i.test(rawEndpoint.trim())
+          ? rawEndpoint.trim()
+          : `${rawEndpoint.trim().replace(/\/+$/g, "")}/v1/chat/completions`;
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${deepseekApiKey}` },
+        body: JSON.stringify({
+          model: Deno.env.get("DEEPSEEK_MODEL") ?? "deepseek-chat",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          max_tokens: 600,
+          temperature: 0.0,
+          stream: false,
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      const payload = await safeReadJson(res);
+      lastPayload = payload;
+      try { console.log("parse-task deepseek response", { status: res.status, ok: res.ok, payload }); } catch {}
+      deepseekLatency = Math.round(performance.now() - started);
+      if (!res.ok) {
+        const snippet = typeof payload === "string" ? payload.slice(0, 200) : JSON.stringify(payload).slice(0, 200);
+        throw new Error(`DeepSeek responded ${res.status}: ${snippet}`);
+      }
+      const message = extractDeepSeekMessage(payload);
+      if (!message) throw new Error("DeepSeek returned no message content");
+
+      const raw = String(message);
+      lastRawMessage = raw;
+      try { console.log("parse-task deepseek message", raw); } catch {}
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        let recovered = extractFirstJsonObject(raw);
+        if (!recovered) {
+          // Retry once with stricter instructions
+          const strictSystem = `${systemPrompt}\nSTRICT OUTPUT: Return exactly one minified JSON object on a single line with no spaces or newlines. No markdown, no code fences, no commentary.`;
+          const strictRes = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${deepseekApiKey}` },
+            body: JSON.stringify({
+              model: Deno.env.get("DEEPSEEK_MODEL") ?? "deepseek-chat",
+              messages: [
+                { role: "system", content: strictSystem },
+                { role: "user", content: userPrompt },
+              ],
+              max_tokens: 1200,
+              temperature: 0.0,
+              top_p: 0,
+              stream: false,
+              response_format: { type: "json_object" },
+            }),
           });
-          deepseekLatency = Math.round(performance.now() - started);
-          if (question) {
-            followUp = { type: "clarify", prompt: question, missing: [...needed] };
-            notes.push("DeepSeek generated a clarifying question.");
-          } else {
-            deepseekUsedFallback = true;
-            notes.push("DeepSeek returned empty response; using deterministic prompt.");
+          const strictPayload = await safeReadJson(strictRes);
+          if (strictRes.ok) {
+            const strictMsg = extractDeepSeekMessage(strictPayload);
+            if (typeof strictMsg === "string") recovered = extractFirstJsonObject(strictMsg) ?? strictMsg;
           }
-        } catch (error) {
-          deepseekErrored = true;
-          deepseekUsedFallback = true;
-          notes.push(describeError("DeepSeek request failed", error));
         }
-      } else {
-        deepseekUsedFallback = true;
-        notes.push("DeepSeek disabled (DEEPSEEK_API_KEY not set); using deterministic prompt.");
+        if (!recovered) throw new Error("DeepSeek did not return valid JSON");
+        try {
+          parsed = JSON.parse(recovered);
+        } catch (e2) {
+          throw new Error("DeepSeek did not return valid JSON");
+        }
       }
+      extraction = normalizeExtraction(parsed);
+      if (!extraction) throw new Error("DeepSeek JSON missing required fields");
 
-      if (!followUp) {
-        followUp = {
-          type: "clarify",
-          prompt: defaultClarifyingQuestion(needed, clarifyingContext),
-          missing: [...needed],
-        };
+      const mapping = mapExtractionToCapture(extraction);
+      captureProposal = mapping;
+
+      // needed list
+      const missing = Array.isArray(extraction.missing) ? extraction.missing.slice() : [];
+      if (extraction.estimated_minutes == null) missing.push("estimated_minutes");
+      missing.sort();
+      for (const m of missing) if (!needed.includes(m)) needed.push(m);
+
+      if (missing.length > 0 && extraction.clarifying_question) {
+        followUp = { type: "clarify", prompt: cleanupQuestion(extraction.clarifying_question)!, missing };
       }
+      notes.push("DeepSeek extracted structured task data.");
+    } catch (error) {
+      deepseekErrored = true;
+      const detail = describeError("DeepSeek extraction failed", error);
+      notes.push(detail);
+      try { console.log("parse-task deepseek extraction failed", { error: String(error), lastRawMessage, lastPayload }); } catch {}
+      return json({
+        error: "DeepSeek extraction failed in conversational_strict mode.",
+        details: detail,
+        notes,
+        debug: {
+          deepseek_raw: lastRawMessage ?? undefined,
+          deepseek_payload_excerpt:
+            typeof lastPayload === "string"
+              ? (lastPayload as string).slice(0, 4000)
+              : JSON.stringify(lastPayload ?? null).slice(0, 4000),
+        },
+      }, 502);
     }
+
 
     const response: ParseResponse = {
       content,
-      structured,
+      structured: {
+        estimated_minutes: extraction?.estimated_minutes ?? undefined,
+        datetime: extraction?.scheduled_time?.datetime ?? extraction?.deadline?.datetime ?? undefined,
+        window:
+          extraction?.execution_window?.start || extraction?.execution_window?.end
+            ? { start: extraction.execution_window?.start ?? undefined, end: extraction.execution_window?.end ?? undefined }
+            : undefined,
+        extraction: extraction ?? undefined,
+        capture: captureProposal ? { ...captureProposal, reason: captureProposalReason(extraction!) } : undefined,
+      },
+      debug: {
+        deepseek_raw: lastRawMessage ?? undefined,
+        deepseek_payload_excerpt:
+          typeof lastPayload === "string"
+            ? (lastPayload as string).slice(0, 4000)
+            : JSON.stringify(lastPayload ?? null).slice(0, 4000),
+      },
       notes,
       needed,
       mode,
       follow_up: followUp ?? null,
       metadata: {
         duckling: {
-          enabled: ducklingEnabled,
-          latency_ms: ducklingLatency,
-          errored: ducklingErrored || undefined,
+          enabled: false,
+          latency_ms: undefined,
+          errored: undefined,
         },
         heuristics,
         deepseek: {
@@ -232,7 +304,7 @@ export async function handler(req: Request) {
           attempted: deepseekAttempted,
           latency_ms: deepseekLatency,
           errored: deepseekErrored ? true : undefined,
-          used_fallback: deepseekUsedFallback ? true : undefined,
+          used_fallback: undefined,
         },
       },
     };
@@ -441,7 +513,19 @@ async function requestDeepSeekClarification(input: {
   context?: { ambiguousTime?: string };
 }) {
   if (!input.apiKey) return null;
-  const endpoint = Deno.env.get("DEEPSEEK_API_URL") ?? "https://api.deepseek.com/v1/chat/completions";
+  const rawEndpoint = Deno.env.get("DEEPSEEK_API_URL");
+  let endpoint: string;
+  if (rawEndpoint && rawEndpoint.trim().length > 0) {
+    const trimmed = rawEndpoint.trim().replace(/\s+/g, "");
+    if (/\/chat\/completions\/?$/i.test(trimmed)) {
+      endpoint = trimmed;
+    } else {
+      const base = trimmed.replace(/\/+$/g, "");
+      endpoint = `${base}/v1/chat/completions`;
+    }
+  } else {
+    endpoint = "https://api.deepseek.com/v1/chat/completions";
+  }
   const systemPrompt =
     "You help DiaGuru collect missing task details. Ask exactly one concise follow-up question to obtain the missing information. Never answer the question yourself.";
   const userPrompt = buildDeepSeekUserPrompt({
@@ -459,7 +543,7 @@ async function requestDeepSeekClarification(input: {
       Authorization: `Bearer ${input.apiKey}`,
     },
     body: JSON.stringify({
-      model: Deno.env.get("DEEPSEEK_MODEL") ?? "deepseek-v3",
+      model: Deno.env.get("DEEPSEEK_MODEL") ?? "deepseek-chat",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -535,7 +619,22 @@ function extractDeepSeekMessage(payload: unknown) {
   const message = (first as Record<string, unknown>).message;
   if (!message || typeof message !== "object") return null;
   const content = (message as Record<string, unknown>).content;
-  return typeof content === "string" ? content : null;
+  if (typeof content === "string") return content;
+  if (content && typeof content === "object") {
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(content)) {
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function cleanupQuestion(question: string) {
@@ -544,47 +643,10 @@ function cleanupQuestion(question: string) {
   return trimmed.replace(/\s*\n\s*/g, " ").replace(/\s{2,}/g, " ");
 }
 
-function defaultClarifyingQuestion(
-  missing: string[],
-  context?: { ambiguousTime?: string },
-) {
-  if (missing.includes("time_meridiem") && context?.ambiguousTime) {
-    return `Did you mean ${context.ambiguousTime}am or ${context.ambiguousTime}pm?`;
-  }
-  if (missing.includes("estimated_minutes")) {
-    return "About how many minutes do you expect this to take?";
-  }
-  return `Could you share the following details: ${missing.join(", ")}?`;
-}
-
 export const __test__ = {
-  pickDurationFromRegex,
-  normalizeDucklingDuration,
-  convertToMinutes,
   cleanupQuestion,
-  defaultClarifyingQuestion,
   buildDeepSeekUserPrompt,
-  detectAmbiguousMeridiemSnippet,
 };
-
-function detectAmbiguousMeridiemSnippet(source: string, fallbackText: string) {
-  const snippet = findAmbiguousTimeToken(source);
-  if (snippet) return snippet;
-  if (!source.trim()) {
-    return findAmbiguousTimeToken(fallbackText);
-  }
-  return null;
-}
-
-function findAmbiguousTimeToken(text: string) {
-  const durationRegex = /\b(hours?|hrs?|minutes?|mins?)\b/i;
-  if (durationRegex.test(text)) return null;
-  const meridiemRegex = /\b(a\.?m\.?|p\.?m\.?|am|pm)\b/i;
-  if (meridiemRegex.test(text)) return null;
-  const match = /\b(0?[1-9]|1[0-2])(:[0-5]\d)?\b/.exec(text);
-  if (!match) return null;
-  return match[0].replace(/^0/, "");
-}
 
 function describeError(prefix: string, error: unknown) {
   if (error instanceof Error) {
@@ -598,4 +660,212 @@ function json(data: unknown, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+// ----- Extraction helpers (schema + prompts) -----
+function extractFirstJsonObject(text: string): string | null {
+  if (!text) return null;
+  const fence = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(text);
+  if (fence && fence[1]) return fence[1].trim();
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) return text.slice(first, last + 1).trim();
+  return null;
+}
+function buildExtractionPrompts(input: { content: string; timezone: string }) {
+  const schema = `{
+  "title": string | null,
+  "estimated_minutes": number | null,
+  "deadline": {
+    "datetime": string | null,
+    "kind": "hard" | "soft" | null,
+    "source": "explicit" | "inferred" | null
+  } | null,
+  "scheduled_time": {
+    "datetime": string | null,
+    "precision": "exact" | "approximate" | null,
+    "source": "explicit" | "inferred" | null
+  } | null,
+  "execution_window": {
+    "relation": "before_deadline" | "after_deadline" | "around_scheduled" | "between" | "on_day" | "anytime" | null,
+    "start": string | null,
+    "end": string | null,
+    "source": "explicit" | "inferred" | "default" | null
+  } | null,
+  "time_preferences": {
+    "time_of_day": "morning" | "afternoon" | "evening" | "night" | null,
+    "day": "today" | "tomorrow" | "specific_date" | "any" | null
+  } | null,
+  "importance": {
+    "urgency": 1 | 2 | 3 | 4 | 5,
+    "impact": 1 | 2 | 3 | 4 | 5,
+    "reschedule_penalty": 0 | 1 | 2 | 3,
+    "blocking": boolean,
+    "rationale": string
+  } | null,
+  "flexibility": {
+    "cannot_overlap": boolean,
+    "start_flexibility": "hard" | "soft" | "anytime",
+    "duration_flexibility": "fixed" | "split_allowed",
+    "min_chunk_minutes": number | null,
+    "max_splits": number | null
+  } | null,
+  "kind": "task" | "appointment" | "call" | "meeting" | "study" | "errand" | "other" | null,
+  "missing": string[],
+  "clarifying_question": string | null,
+  "notes": string[]
+}`;
+  const rules = `Goals:\n- Interpret the user's text as a task they want to DO.\n- Distinguish clearly between DEADLINE (due/by) and SCHEDULED TIME (when to work).\n- Model how the work should be arranged in time (execution window).\n\nRules:\n- Respond ONLY with minified JSON.\n- If value is explicit or reasonably inferred, fill it; otherwise set null and add to \"missing\".\n- Infer a reasonable \"estimated_minutes\" when possible.\n- Use provided Timezone and Now for relative phrases.\n- Treat \"due/by/deadline/hand in\" as DEADLINES (set deadline.datetime/kind and execution_window.relation=before_deadline; execution_window.end=deadline).\n- \"at 3pm work on X\" → scheduled_time.datetime (+precision), execution_window.relation=around_scheduled.\n- \"between 3 and 5\" or \"tomorrow afternoon\" → execution_window.relation=between/on_day and fill start/end when resolvable.\n- time_preferences captures soft hints (morning/evening/tomorrow).\n- If anything is missing, include one concise clarifying_question.`;
+  const systemPrompt = `You are a task extraction assistant for DiaGuru.\n${rules}\nSchema:\n${schema}`;
+  const userPrompt = `Text: """${input.content}"""\nTimezone: ${input.timezone}\nNow: ${new Date().toISOString()}\nWorkingHours: 08:00-22:00 (local)`;
+  return { systemPrompt, userPrompt };
+}
+
+function normalizeExtraction(obj: any): DiaGuruTaskExtraction | null {
+  if (!obj || typeof obj !== "object") return null;
+  const s = (v: any) => (typeof v === "string" ? v : null);
+  const n = (v: any) => {
+    const num = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+    return Number.isFinite(num) ? num : null;
+  };
+  const one = <T extends string>(v: any, vals: readonly T[]): T | null =>
+    typeof v === "string" && (vals as readonly string[]).includes(v) ? (v as T) : null;
+
+  const deadline = obj.deadline && typeof obj.deadline === "object"
+    ? {
+        datetime: s(obj.deadline.datetime),
+        kind: one(obj.deadline.kind, ["hard", "soft"] as const),
+        source: one(obj.deadline.source, ["explicit", "inferred"] as const),
+      }
+    : null;
+  const scheduled_time = obj.scheduled_time && typeof obj.scheduled_time === "object"
+    ? {
+        datetime: s(obj.scheduled_time.datetime),
+        precision: one(obj.scheduled_time.precision, ["exact", "approximate"] as const),
+        source: one(obj.scheduled_time.source, ["explicit", "inferred"] as const),
+      }
+    : null;
+  const execution_window = obj.execution_window && typeof obj.execution_window === "object"
+    ? {
+        relation: one(obj.execution_window.relation, [
+          "before_deadline",
+          "after_deadline",
+          "around_scheduled",
+          "between",
+          "on_day",
+          "anytime",
+        ] as const),
+        start: obj.execution_window.start === null ? null : s(obj.execution_window.start),
+        end: obj.execution_window.end === null ? null : s(obj.execution_window.end),
+        source: one(obj.execution_window.source, ["explicit", "inferred", "default"] as const),
+      }
+    : null;
+  const time_preferences = obj.time_preferences && typeof obj.time_preferences === "object"
+    ? {
+        time_of_day: one(obj.time_preferences.time_of_day, ["morning", "afternoon", "evening", "night"] as const),
+        day: one(obj.time_preferences.day, ["today", "tomorrow", "specific_date", "any"] as const),
+      }
+    : null;
+
+  const importance = obj.importance && typeof obj.importance === "object"
+    ? {
+        urgency: n((obj.importance as any).urgency) as any,
+        impact: n((obj.importance as any).impact) as any,
+        reschedule_penalty: n((obj.importance as any).reschedule_penalty) as any,
+        blocking: Boolean((obj.importance as any).blocking),
+        rationale: typeof (obj.importance as any).rationale === "string" ? (obj.importance as any).rationale : "",
+      }
+    : null;
+  const flexibility = obj.flexibility && typeof obj.flexibility === "object"
+    ? {
+        cannot_overlap: Boolean((obj.flexibility as any).cannot_overlap),
+        start_flexibility: one((obj.flexibility as any).start_flexibility, ["hard", "soft", "anytime"] as const) ?? "soft",
+        duration_flexibility: one((obj.flexibility as any).duration_flexibility, ["fixed", "split_allowed"] as const) ?? "fixed",
+        min_chunk_minutes: n((obj.flexibility as any).min_chunk_minutes),
+        max_splits: n((obj.flexibility as any).max_splits),
+      }
+    : null;
+
+  return {
+    title: s(obj.title),
+    estimated_minutes: n(obj.estimated_minutes),
+    deadline,
+    scheduled_time,
+    execution_window,
+    time_preferences,
+    importance,
+    flexibility,
+    kind: typeof obj.kind === "string" ? (obj.kind as any) : null,
+    missing: Array.isArray(obj.missing) ? obj.missing.map(String) : [],
+    clarifying_question: obj.clarifying_question == null ? null : String(obj.clarifying_question),
+    notes: Array.isArray(obj.notes) ? obj.notes.map(String) : [],
+  };
+}
+
+function mapExtractionToCapture(ex: DiaGuruTaskExtraction): CaptureMapping {
+  // Defaults
+  let constraint_type: CaptureMapping["constraint_type"] = "flexible";
+  let constraint_time: string | null = null;
+  let constraint_end: string | null = null;
+  let constraint_date: string | null = null;
+  let original_target_time: string | null = null;
+  let deadline_at: string | null = ex.deadline?.datetime ?? null;
+  let window_start: string | null = null;
+  let window_end: string | null = null;
+  let start_target_at: string | null = null;
+  let is_soft_start = false;
+  let task_type_hint: string | null = ex.title;
+
+  // Prioritize scheduled_time if present
+  if (ex.scheduled_time?.datetime) {
+    constraint_type = "start_time";
+    constraint_time = ex.scheduled_time.datetime;
+    original_target_time = ex.scheduled_time.datetime;
+    start_target_at = ex.scheduled_time.datetime;
+    is_soft_start = ex.scheduled_time.precision === "approximate" || ex.scheduled_time.source === "inferred";
+  }
+
+  // Execution window explicit
+  if (ex.execution_window?.relation === "between" || ex.execution_window?.relation === "on_day") {
+    if (ex.execution_window.start || ex.execution_window.end) {
+      constraint_type = "window";
+      constraint_time = ex.execution_window.start ?? null;
+      constraint_end = ex.execution_window.end ?? null;
+      window_start = constraint_time;
+      window_end = constraint_end;
+    }
+  }
+
+  // Deadline semantics
+  if (ex.execution_window?.relation === "before_deadline" && ex.deadline?.datetime) {
+    constraint_type = "deadline_time";
+    constraint_time = ex.deadline.datetime;
+    deadline_at = ex.deadline.datetime;
+    // Optionally provide a window end for schedulers that also use window
+    window_end = ex.deadline.datetime;
+  }
+
+  return {
+    estimated_minutes: ex.estimated_minutes ?? null,
+    constraint_type,
+    constraint_time,
+    constraint_end,
+    constraint_date,
+    original_target_time,
+    deadline_at,
+    window_start,
+    window_end,
+    start_target_at,
+    is_soft_start,
+    task_type_hint,
+  };
+}
+
+function captureProposalReason(ex: DiaGuruTaskExtraction): string {
+  const bits: string[] = [];
+  if (ex.deadline?.datetime) bits.push(`deadline=${ex.deadline.datetime}`);
+  if (ex.scheduled_time?.datetime) bits.push(`scheduled=${ex.scheduled_time.datetime}`);
+  if (ex.execution_window?.relation) bits.push(`window=${ex.execution_window.relation}`);
+  if (ex.time_preferences?.time_of_day) bits.push(`pref=${ex.time_preferences.time_of_day}`);
+  return `Mapped from extraction (${bits.join(", ")})`;
 }
