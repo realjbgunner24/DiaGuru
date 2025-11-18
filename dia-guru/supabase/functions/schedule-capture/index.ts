@@ -1,5 +1,12 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
 import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
+import {
+  schedulerConfig,
+  computePrioritySnapshot,
+  computeRigidityScore,
+  logSchedulerEvent,
+} from "./scheduler-config.ts";
+import { replaceCaptureChunks } from "./chunks.ts";
 import { computePriorityScore, type PriorityInput } from "../../../shared/priority.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
@@ -243,6 +250,16 @@ export async function handler(req: Request) {
     const planActions: PlanActionRecord[] = [];
     let planRunCreated = false;
 
+    const prioritySnapshot = computePrioritySnapshot(capture as CaptureEntryRow, now);
+    const rigidityScore = computeRigidityScore(capture as CaptureEntryRow, now);
+    logSchedulerEvent("capture.metrics", {
+      captureId: capture.id,
+      priority: prioritySnapshot.score,
+      perMinute: Number(prioritySnapshot.perMinute.toFixed(3)),
+      rigidity: Number(rigidityScore.toFixed(2)),
+      durationMinutes,
+    });
+
     const ensurePlanRun = async () => {
       if (planRunCreated) return;
       const { error } = await admin
@@ -436,6 +453,10 @@ export async function handler(req: Request) {
         }
       }
 
+      // Hard guard: ensure slot respects deadline/window
+      if (!isSlotWithinConstraints(capture, preferredSlot)) {
+        return json({ error: "Requested slot exceeds deadline/window." }, 409);
+      }
       const actionId = crypto.randomUUID();
       const prevSnapshot = snapshotFromRow(capture);
       const createdEvent = await google.createEvent({
@@ -485,6 +506,10 @@ export async function handler(req: Request) {
 
       if (updateError) return json({ error: updateError.message }, 500);
 
+      await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
+        { start: preferredSlot.start, end: preferredSlot.end },
+      ]);
+
       await recordPlanAction({
         actionId,
         captureId: capture.id,
@@ -511,11 +536,104 @@ export async function handler(req: Request) {
       isSoftStart: capture.is_soft_start,
     });
     if (!candidate) {
-      return json({ error: "No available slot within the next week." }, 409);
+      // Fallback preemption attempt for deadline/window plans: try latest legal slot and rebalance DiaGuru tasks
+      if (plan.mode === "deadline" && plan.deadline) {
+        const latestStart = new Date(plan.deadline.getTime() - durationMinutes * 60000);
+        const preferredSlot = { start: new Date(Math.max(latestStart.getTime(), now.getTime())), end: plan.deadline };
+        // Validate working window
+        const withinWorkingHours = isSlotWithinWorkingWindow(preferredSlot, offsetMinutes);
+        if (withinWorkingHours && isSlotWithinConstraints(capture, preferredSlot)) {
+          const conflicts = collectConflictingEvents(preferredSlot, events);
+          const externalConflicts = conflicts.filter((c) => !c.diaGuru);
+          const diaGuruConflicts = conflicts.filter((c) => c.diaGuru && c.captureId);
+          if (conflicts.length > 0 && externalConflicts.length === 0 && diaGuruConflicts.length > 0) {
+            // Remove conflicting DiaGuru events and reschedule them after placing this urgent task
+            const conflictIds = new Set(diaGuruConflicts.map((c) => c.id));
+            events = events.filter((e) => !conflictIds.has(e.id));
+            eventsById = new Map(events.map((e) => [e.id, e]));
+            busyIntervals = computeBusyIntervals(events);
+
+            const actionId = crypto.randomUUID();
+            const prevSnapshot = snapshotFromRow(capture);
+            const createdEvent = await google.createEvent({ capture, slot: preferredSlot, planId, actionId, priorityScore: capturePriority });
+            registerInterval(busyIntervals, preferredSlot);
+
+            // Load capture rows and attempt reschedule of displaced captures
+            const conflictMap = await loadConflictCaptures(admin, diaGuruConflicts);
+            const toReschedule = Array.from(conflictMap.values());
+            if (toReschedule.length > 0) {
+              await rescheduleCaptures({ captures: toReschedule, admin, busyIntervals, offsetMinutes, referenceNow: now, google, planId, recordPlanAction });
+            }
+
+            const { data: updated, error: updateError } = await admin
+              .from("capture_entries")
+              .update({
+                status: "scheduled",
+                planned_start: preferredSlot.start.toISOString(),
+                planned_end: preferredSlot.end.toISOString(),
+                scheduled_for: preferredSlot.start.toISOString(),
+                calendar_event_id: createdEvent.id,
+                calendar_event_etag: createdEvent.etag,
+                plan_id: planId,
+                freeze_until: null,
+                scheduling_notes: "Scheduled at latest legal slot; rebalanced DiaGuru sessions.",
+              })
+              .eq("id", capture.id)
+              .select("*")
+              .single();
+            if (updateError) return json({ error: updateError.message }, 500);
+
+            if (updated) {
+              await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
+                { start: preferredSlot.start, end: preferredSlot.end },
+              ]);
+            }
+
+            await recordPlanAction({
+              actionId,
+              captureId: capture.id,
+              captureContent: capture.content,
+              actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+              prev: prevSnapshot,
+              next: snapshotFromRow(updated as CaptureEntryRow),
+            });
+
+            const planSummary = await finalizePlan();
+            return json({ message: "Capture scheduled via preemption.", capture: updated, planSummary });
+          }
+        }
+      }
+      // No legal slot available. Return detailed reason for client logging.
+      const deadlineIso = capture.deadline_at ?? capture.window_end ?? capture.constraint_end ?? (capture.constraint_type === "deadline_time" ? capture.constraint_time : null);
+      return json(
+        {
+          error: "No available slot within constraints.",
+          reason: "no_slot",
+          capture_id: capture.id,
+          mode: plan.mode,
+          duration_minutes: durationMinutes,
+          deadline: deadlineIso,
+          reference_now: now.toISOString(),
+        },
+        409,
+      );
     }
 
     const autoActionId = crypto.randomUUID();
     const prevSnapshot = snapshotFromRow(capture);
+    // Hard guard: ensure slot respects deadline/window
+    if (!isSlotWithinConstraints(capture, candidate)) {
+      return json(
+        {
+          error: "Found slot exceeds deadline/window.",
+          reason: "slot_exceeds_deadline",
+          capture_id: capture.id,
+          slot: { start: candidate.start.toISOString(), end: candidate.end.toISOString() },
+          deadline: capture.deadline_at ?? capture.window_end ?? capture.constraint_end ?? (capture.constraint_type === "deadline_time" ? capture.constraint_time : null),
+        },
+        409,
+      );
+    }
     const createdEvent = await google.createEvent({
       capture,
       slot: candidate,
@@ -542,6 +660,12 @@ export async function handler(req: Request) {
       .single();
 
     if (updateError) return json({ error: updateError.message }, 500);
+
+    if (updated) {
+      await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
+        { start: candidate.start, end: candidate.end },
+      ]);
+    }
 
     await recordPlanAction({
       actionId: autoActionId,
@@ -1036,6 +1160,22 @@ function buildPriorityInput(capture: CaptureEntryRow): PriorityInput {
   };
 }
 
+function isSlotWithinConstraints(capture: CaptureEntryRow, slot: { start: Date; end: Date }) {
+  const candidates: Date[] = [];
+  const pushIfValid = (iso: string | null) => {
+    if (!iso) return;
+    const d = new Date(iso);
+    if (!Number.isNaN(d.getTime())) candidates.push(d);
+  };
+  pushIfValid(capture.deadline_at);
+  pushIfValid(capture.window_end);
+  pushIfValid(capture.constraint_end);
+  if (capture.constraint_type === "deadline_time") pushIfValid(capture.constraint_time);
+  if (candidates.length === 0) return true;
+  const minEnd = new Date(Math.min(...candidates.map((d) => d.getTime())));
+  return slot.end.getTime() <= minEnd.getTime();
+}
+
 function hasActiveFreeze(capture: CaptureEntryRow, referenceNow: Date) {
   if (!capture.freeze_until) return false;
   const freezeTs = Date.parse(capture.freeze_until);
@@ -1308,6 +1448,7 @@ async function rescheduleCaptures(args: {
           scheduling_notes: "Unable to reschedule automatically. Please choose a new time.",
         })
         .eq("id", capture.id);
+      await replaceCaptureChunks(admin, capture, []);
       continue;
     }
 
@@ -1339,6 +1480,9 @@ async function rescheduleCaptures(args: {
         .select("*")
         .single();
       if (!error && data) {
+        await replaceCaptureChunks(admin, data as CaptureEntryRow, [
+          { start: slot.start, end: slot.end },
+        ]);
         registerInterval(busyIntervals, slot);
         await recordPlanAction({
           actionId,
@@ -1358,6 +1502,7 @@ async function rescheduleCaptures(args: {
           scheduling_notes: "Reschedule attempt failed. Please retry manually.",
         })
         .eq("id", capture.id);
+      await replaceCaptureChunks(admin, capture, []);
     }
   }
 }

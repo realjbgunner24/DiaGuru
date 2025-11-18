@@ -682,10 +682,28 @@ export default function HomeTab() {
           setRecentPlan(response.planSummary);
         }
         await refreshCalendarHealth();
+        if (response) {
+          console.log('schedule-capture response payload', response);
+        }
         return response;
-      } catch (error) {
+      } catch (error: any) {
         console.log('schedule-capture error', error);
-        const message = extractScheduleError(error);
+        let message = extractScheduleError(error);
+        // Try to extract JSON error payload from FunctionsHttpError
+        try {
+          const ctx = (error as any)?.context;
+          if (ctx && typeof ctx.json === 'function') {
+            const payload = await ctx.json();
+            console.log('schedule-capture response payload', payload);
+            if (payload?.error) message = String(payload.error);
+            if (payload?.reason === 'no_slot' && payload?.deadline) {
+              message = `${message} (no legal slot before ${payload.deadline})`;
+            }
+            if (payload?.reason === 'slot_exceeds_deadline' && payload?.slot?.end && payload?.deadline) {
+              message = `${message} (slot ${payload.slot.end} > deadline ${payload.deadline})`;
+            }
+          }
+        } catch {}
         Alert.alert('Scheduling failed', message);
         if (message?.toLowerCase().includes('google calendar not linked')) {
           refreshCalendarHealth();
@@ -714,6 +732,9 @@ export default function HomeTab() {
             timezone,
             timezoneOffsetMinutes,
           });
+          if (resp) {
+            console.log('schedule-capture response payload', resp);
+          }
           let scheduled = !resp?.decision;
 
           // If server returns a conflict decision with a suggestion, try suggested slot first
@@ -752,10 +773,16 @@ export default function HomeTab() {
           if (scheduled) scheduledCount += 1;
           // Refresh lists incrementally to keep busy intervals consistent server-side
           await Promise.all([loadPending(), loadScheduled()]);
-        } catch (e) {
+        } catch (e: any) {
           // Skip problematic capture; continue with the rest
-          // eslint-disable-next-line no-console
           console.log('queue scheduling error', cap.id, e);
+          try {
+            const ctx = (e as any)?.context;
+            if (ctx && typeof ctx.json === 'function') {
+              const payload = await ctx.json();
+              console.log('queue scheduling response payload', cap.id, payload);
+            }
+          } catch {}
           continue;
         }
       }

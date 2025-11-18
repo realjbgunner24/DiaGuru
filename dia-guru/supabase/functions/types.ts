@@ -45,6 +45,18 @@ export type CaptureEntryRow = {
   manual_touch_at: string | null;
 };
 
+
+export type CaptureChunkRow = {
+  id: string;
+  capture_id: string;
+  start: string;
+  end: string;
+  late: boolean;
+  overlapped: boolean;
+  prime: boolean;
+  created_at?: string;
+};
+
 export type CalendarTokenRow = {
   account_id: number;
   access_token: string;
@@ -96,6 +108,7 @@ export type Database = {
   public: {
     Tables: {
       capture_entries: { Row: CaptureEntryRow };
+      capture_chunks: { Row: CaptureChunkRow };
       calendar_accounts: { Row: CalendarAccountRow };
       calendar_tokens: { Row: CalendarTokenRow };
       plan_runs: { Row: PlanRunRow };
@@ -106,3 +119,4 @@ export type Database = {
     CompositeTypes: Record<string, never>;
   };
 };
+
