@@ -1,0 +1,50 @@
+{
+  "captures": [
+    {
+      "content": "Sleep today at 12am",
+      "estimated_minutes": 480,
+      "task_type_hint": "routine.sleep",
+      "constraint_type": "start_time",
+      "constraint_time": "2025-11-20T06:00:00Z",
+      "duration_flexibility": "fixed",
+      "start_flexibility": "soft",
+      "cannot_overlap": true,
+      "urgency": 3,
+      "impact": 3,
+      "reschedule_penalty": 1,
+      "blocking": false
+    },
+    {
+      "content": "Apply to jobs before I sleep today",
+      "estimated_minutes": 60,
+      "task_type_hint": "task",
+      "constraint_type": "deadline_time",
+      "constraint_time": "2025-11-20T06:00:00Z",
+      "duration_flexibility": "split_allowed",
+      "start_flexibility": "soft",
+      "cannot_overlap": false,
+      "urgency": 4,
+      "impact": 4,
+      "reschedule_penalty": 2,
+      "blocking": false
+    },
+    {
+      "content": "Assignment due at 2pm today",
+      "estimated_minutes": 60,
+      "task_type_hint": "Assignment",
+      "constraint_type": "deadline_time",
+      "constraint_time": "2025-11-19T20:00:00Z",
+      "duration_flexibility": "split_allowed",
+      "start_flexibility": "soft",
+      "cannot_overlap": false,
+      "urgency": 5,
+      "impact": 4,
+      "reschedule_penalty": 3,
+      "blocking": true
+    }
+  ],
+  "meta": {
+    "working_window": "08:00-22:00",
+    "notes": "Regression scenario: sleep anchors night, apply-to-jobs before sleep, assignment in afternoon"
+  }
+}

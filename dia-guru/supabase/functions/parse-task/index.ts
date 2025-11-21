@@ -123,6 +123,7 @@ export async function handler(req: Request) {
     }
 
     const timezone = (body.timezone ?? DEFAULT_TIMEZONE).trim() || DEFAULT_TIMEZONE;
+    const referenceNow = parseReferenceNow(body.now) ?? new Date();
     const deepseekApiKey = Deno.env.get("DEEPSEEK_API_KEY") ?? "";
     const deepseekEnabled = deepseekApiKey.length > 0;
 
@@ -236,6 +237,13 @@ export async function handler(req: Request) {
       extraction = normalizeExtraction(parsed);
       if (!extraction) throw new Error("DeepSeek JSON missing required fields");
 
+      applyRoutineNormalization({
+        extraction,
+        content,
+        timezone,
+        referenceNow,
+      });
+
       const mapping = mapExtractionToCapture(extraction);
       captureProposal = mapping;
 
@@ -306,8 +314,30 @@ export async function handler(req: Request) {
           errored: deepseekErrored ? true : undefined,
           used_fallback: undefined,
         },
-      },
+    },
     };
+
+    try {
+      console.log("[dg.parse] summary", {
+        content,
+        estimated_minutes: extraction?.estimated_minutes ?? null,
+        constraint_type: response.structured.capture?.constraint_type ?? null,
+        constraint_time: response.structured.capture?.constraint_time ?? null,
+        window_start: response.structured.capture?.window_start ?? null,
+        window_end: response.structured.capture?.window_end ?? null,
+        deadline_at: response.structured.capture?.deadline_at ?? null,
+        start_flexibility: extraction?.flexibility?.start_flexibility ?? null,
+        duration_flexibility: extraction?.flexibility?.duration_flexibility ?? null,
+        cannot_overlap: extraction?.flexibility?.cannot_overlap ?? null,
+        urgency: extraction?.importance?.urgency ?? null,
+        impact: extraction?.importance?.impact ?? null,
+        reschedule_penalty: extraction?.importance?.reschedule_penalty ?? null,
+        blocking: extraction?.importance?.blocking ?? null,
+        time_pref_day: extraction?.time_preferences?.day ?? null,
+        time_pref_time_of_day: extraction?.time_preferences?.time_of_day ?? null,
+        kind: extraction?.kind ?? null,
+      });
+    } catch {}
 
     return json(response);
   } catch (error) {
@@ -814,7 +844,7 @@ function mapExtractionToCapture(ex: DiaGuruTaskExtraction): CaptureMapping {
   let window_end: string | null = null;
   let start_target_at: string | null = null;
   let is_soft_start = false;
-  let task_type_hint: string | null = ex.title;
+  let task_type_hint: string | null = ex.kind ?? ex.title;
 
   // Prioritize scheduled_time if present
   if (ex.scheduled_time?.datetime) {
@@ -868,4 +898,250 @@ function captureProposalReason(ex: DiaGuruTaskExtraction): string {
   if (ex.execution_window?.relation) bits.push(`window=${ex.execution_window.relation}`);
   if (ex.time_preferences?.time_of_day) bits.push(`pref=${ex.time_preferences.time_of_day}`);
   return `Mapped from extraction (${bits.join(", ")})`;
+}
+
+function parseReferenceNow(value?: string | null) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function applyRoutineNormalization(args: {
+  extraction: DiaGuruTaskExtraction;
+  content: string;
+  timezone: string;
+  referenceNow: Date;
+}) {
+  const { extraction, content, timezone, referenceNow } = args;
+  const normalizedText = content.toLowerCase();
+  const mentionsSleep = /\b(sleep|nap|bed ?time)\b/i.test(content);
+  const mentionsMeal = /\b(eat|meal|breakfast|lunch|dinner|snack)\b/i.test(content);
+
+  if (mentionsSleep) {
+    normalizeSleepExtraction(extraction, timezone, referenceNow);
+  } else if (mentionsMeal) {
+    normalizeMealExtraction(extraction, timezone, referenceNow, normalizedText);
+  }
+
+  if (/\bbefore (i )?sleep\b/i.test(content)) {
+    applyBeforeSleepDeadline(extraction, timezone, referenceNow);
+  }
+}
+
+function normalizeSleepExtraction(extraction: DiaGuruTaskExtraction, timezone: string, referenceNow: Date) {
+  extraction.kind = "routine.sleep";
+  const importance = extraction.importance ?? {
+    urgency: 2,
+    impact: 2,
+    reschedule_penalty: 1,
+    blocking: false,
+    rationale: extraction.importance?.rationale ?? "Sleep routine normalized.",
+  };
+  importance.urgency = Math.min(importance.urgency ?? 2, 3) as 1 | 2 | 3 | 4 | 5;
+  importance.impact = Math.min(importance.impact ?? 2, 3) as 1 | 2 | 3 | 4 | 5;
+  importance.reschedule_penalty = Math.min(importance.reschedule_penalty ?? 1, 1) as 0 | 1 | 2 | 3;
+  importance.blocking = false;
+  extraction.importance = importance;
+
+  const flexibility = extraction.flexibility ?? {
+    cannot_overlap: true,
+    start_flexibility: "soft",
+    duration_flexibility: "fixed",
+    min_chunk_minutes: extraction.estimated_minutes ?? 60,
+    max_splits: 1,
+  };
+  flexibility.cannot_overlap = true;
+  flexibility.start_flexibility = "soft";
+  flexibility.duration_flexibility = "fixed";
+  flexibility.min_chunk_minutes = Math.max(flexibility.min_chunk_minutes ?? 60, 30);
+  flexibility.max_splits = 1;
+  extraction.flexibility = flexibility;
+
+  if (!hasExplicitWindow(extraction)) {
+    const windowStart = buildZonedDateTime({
+      timezone,
+      reference: referenceNow,
+      hour: 22,
+      minute: 30,
+    });
+    const windowEnd = buildZonedDateTime({
+      timezone,
+      reference: referenceNow,
+      hour: 7,
+      minute: 30,
+      dayOffset: 1,
+    });
+    extraction.execution_window = {
+      relation: "between",
+      start: windowStart,
+      end: windowEnd,
+      source: "default",
+    };
+  }
+
+  if (extraction.deadline && extraction.deadline.source !== "explicit") {
+    extraction.deadline = null;
+  }
+}
+
+function normalizeMealExtraction(
+  extraction: DiaGuruTaskExtraction,
+  timezone: string,
+  referenceNow: Date,
+  normalizedText: string,
+) {
+  extraction.kind = "routine.meal";
+  const importance = extraction.importance ?? {
+    urgency: 2,
+    impact: 2,
+    reschedule_penalty: 0,
+    blocking: false,
+    rationale: extraction.importance?.rationale ?? "Meal routine normalized.",
+  };
+  importance.urgency = Math.min(importance.urgency ?? 2, 2) as 1 | 2 | 3 | 4 | 5;
+  importance.impact = Math.min(importance.impact ?? 2, 2) as 1 | 2 | 3 | 4 | 5;
+  importance.reschedule_penalty = 0;
+  importance.blocking = false;
+  extraction.importance = importance;
+
+  const flexibility = extraction.flexibility ?? {
+    cannot_overlap: false,
+    start_flexibility: "soft",
+    duration_flexibility: "fixed",
+    min_chunk_minutes: extraction.estimated_minutes ?? 30,
+    max_splits: 1,
+  };
+  flexibility.cannot_overlap = false;
+  flexibility.start_flexibility = "soft";
+  flexibility.duration_flexibility = "fixed";
+  flexibility.min_chunk_minutes = Math.max(flexibility.min_chunk_minutes ?? 30, 15);
+  flexibility.max_splits = 1;
+  extraction.flexibility = flexibility;
+
+  if (!hasExplicitWindow(extraction)) {
+    const window = inferMealWindow(normalizedText);
+    const windowStart = buildZonedDateTime({
+      timezone,
+      reference: referenceNow,
+      hour: window.startHour,
+      minute: window.startMinute,
+    });
+    const windowEnd = buildZonedDateTime({
+      timezone,
+      reference: referenceNow,
+      hour: window.endHour,
+      minute: window.endMinute,
+    });
+    extraction.execution_window = {
+      relation: "between",
+      start: windowStart,
+      end: windowEnd,
+      source: "default",
+    };
+  }
+}
+
+function applyBeforeSleepDeadline(extraction: DiaGuruTaskExtraction, timezone: string, referenceNow: Date) {
+  const defaultDeadline = buildZonedDateTime({
+    timezone,
+    reference: referenceNow,
+    hour: 23,
+    minute: 30,
+  });
+
+  if (!extraction.deadline) {
+    extraction.deadline = { datetime: defaultDeadline, kind: "soft", source: "inferred" };
+  } else {
+    extraction.deadline.datetime = defaultDeadline;
+    extraction.deadline.kind = extraction.deadline.kind === "hard" ? "soft" : extraction.deadline.kind;
+    extraction.deadline.source = extraction.deadline.source ?? "inferred";
+  }
+
+  extraction.execution_window = extraction.execution_window ?? {
+    relation: "before_deadline",
+    start: null,
+    end: defaultDeadline,
+    source: "default",
+  };
+  extraction.execution_window.relation = "before_deadline";
+  extraction.execution_window.end = defaultDeadline;
+}
+
+function hasExplicitWindow(extraction: DiaGuruTaskExtraction) {
+  return Boolean(extraction.execution_window?.start && extraction.execution_window?.end);
+}
+
+function inferMealWindow(text: string) {
+  if (/\bbreakfast\b/.test(text) || /\bmorning\b/.test(text)) {
+    return { startHour: 7, startMinute: 30, endHour: 9, endMinute: 30 };
+  }
+  if (/\blunch\b/.test(text) || /\bmidday\b/.test(text) || /\bnoon\b/.test(text)) {
+    return { startHour: 12, startMinute: 0, endHour: 14, endMinute: 0 };
+  }
+  if (/\bdinner\b/.test(text) || /\bevening\b/.test(text)) {
+    return { startHour: 18, startMinute: 0, endHour: 20, endMinute: 0 };
+  }
+  return { startHour: 12, startMinute: 0, endHour: 13, endMinute: 0 };
+}
+
+function buildZonedDateTime(args: {
+  timezone: string;
+  reference: Date;
+  hour: number;
+  minute: number;
+  dayOffset?: number;
+}) {
+  const { timezone, reference, hour, minute } = args;
+  const dayOffset = args.dayOffset ?? computeDayOffset(reference, timezone, hour, minute);
+  const dateParts = getLocalDateParts(reference, timezone);
+  const utcGuess = new Date(
+    Date.UTC(dateParts.year, dateParts.month - 1, dateParts.day + dayOffset, hour, minute, 0, 0),
+  );
+  const offsetMinutes = getTimezoneOffsetMinutes(utcGuess, timezone);
+  return new Date(utcGuess.getTime() - offsetMinutes * 60000).toISOString();
+}
+
+function computeDayOffset(reference: Date, timezone: string, targetHour: number, targetMinute: number) {
+  const { hour, minute } = getLocalTimeParts(reference, timezone);
+  if (hour > targetHour) return 1;
+  if (hour === targetHour && minute >= targetMinute) return 1;
+  return 0;
+}
+
+function getLocalDateParts(reference: Date, timezone: string) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(reference);
+  const lookup = (type: "year" | "month" | "day") =>
+    parseInt(parts.find((p) => p.type === type)?.value ?? "0", 10);
+  return {
+    year: lookup("year"),
+    month: lookup("month"),
+    day: lookup("day"),
+  };
+}
+
+function getLocalTimeParts(reference: Date, timezone: string) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const [hourStr, minuteStr] = formatter.format(reference).split(":");
+  return {
+    hour: parseInt(hourStr, 10),
+    minute: parseInt(minuteStr, 10),
+  };
+}
+
+function getTimezoneOffsetMinutes(date: Date, timeZone: string) {
+  const localDate = new Date(date.toLocaleString("en-US", { timeZone }));
+  const utcDate = new Date(date.toLocaleString("en-US", { timeZone: "UTC" }));
+  return (localDate.getTime() - utcDate.getTime()) / 60000;
 }

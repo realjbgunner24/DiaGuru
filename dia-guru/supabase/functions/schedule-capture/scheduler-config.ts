@@ -24,6 +24,27 @@ type SchedulerConfig = {
   fragmentation: {
     coefficient: number;
   };
+  preemption: {
+    baseThreshold: number;
+    movePenalty: number;
+    gainPerMinuteThreshold: number;
+  };
+  limits: {
+    maxMovedTasksPerRun: number;
+    maxRippleDepth: number;
+    maxTotalMinutesShifted: number;
+  };
+  chunking: {
+    targetChunkMinutes: number;
+  };
+  overlap: {
+    enabled: boolean;
+    maxConcurrency: number;
+    dailyBudgetMinutes: number;
+    perTaskOverlapFraction: number;
+    softCostPerMinute: number;
+  };
+  timeOfDayDefaults: Record<string, { start: number; end: number }[]>;
 };
 
 export const schedulerConfig: SchedulerConfig = {
@@ -49,6 +70,41 @@ export const schedulerConfig: SchedulerConfig = {
   },
   fragmentation: {
     coefficient: 2,
+  },
+  preemption: {
+    baseThreshold: 12,
+    movePenalty: 4,
+    gainPerMinuteThreshold: 0.08,
+  },
+  limits: {
+    maxMovedTasksPerRun: 5,
+    maxRippleDepth: 2,
+    maxTotalMinutesShifted: 240,
+  },
+  chunking: {
+    targetChunkMinutes: 60,
+  },
+  overlap: {
+    enabled: true,
+    maxConcurrency: 2,
+    dailyBudgetMinutes: 90,
+    perTaskOverlapFraction: 0.5,
+    softCostPerMinute: 0.03,
+  },
+  timeOfDayDefaults: {
+    deep_work: [{ start: 8, end: 12 }],
+    admin: [{ start: 13, end: 17 }],
+    creative: [{ start: 10, end: 15 }],
+    errand: [{ start: 12, end: 18 }],
+    health: [{ start: 6, end: 9 }, { start: 17, end: 20 }],
+    social: [{ start: 18, end: 22 }],
+    collaboration: [{ start: 9, end: 17 }],
+    "routine.sleep": [{ start: 22, end: 31 }], // 22:00 -> 07:00 next day
+    "routine.meal": [
+      { start: 7.5, end: 9.5 },  // breakfast
+      { start: 12, end: 14 },    // lunch
+      { start: 18, end: 20 },    // dinner
+    ],
   },
 };
 
@@ -178,4 +234,98 @@ export function logSchedulerEvent(event: string, payload: Record<string, unknown
   } catch {
     // no-op
   }
+}
+
+export type PreemptionDisplacement = {
+  capture: CaptureEntryRow;
+  minutes: number;
+};
+
+export type NetGainEvaluation = {
+  targetPriority: {
+    score: number;
+    perMinute: number;
+  };
+  benefit: number;
+  cost: number;
+  overlapCost: number;
+  net: number;
+  perMinuteGain: number;
+  movedTasks: number;
+  totalDisplacedMinutes: number;
+  thresholds: {
+    base: number;
+    gainPerMinute: number;
+    movePenalty: number;
+  };
+  meetsBaseThreshold: boolean;
+  meetsGainPerMinuteThreshold: boolean;
+  allowed: boolean;
+  limitChecks: {
+    exceedsTaskCap: boolean;
+    exceedsMinuteCap: boolean;
+    maxMovedTasks: number;
+    maxMinutesShifted: number;
+  };
+};
+
+export function evaluatePreemptionNetGain(args: {
+  target: CaptureEntryRow;
+  displacements: PreemptionDisplacement[];
+  minutesClaimed: number;
+  referenceNow: Date;
+  overlapMinutes?: number;
+}): NetGainEvaluation {
+  const minutesClaimed = Math.max(1, args.minutesClaimed);
+  const priority = computePrioritySnapshot(args.target, args.referenceNow);
+  const benefit = priority.perMinute * minutesClaimed;
+
+  let cost = 0;
+  let totalDisplacedMinutes = 0;
+  for (const displacement of args.displacements) {
+    const minutes = Math.max(0, displacement.minutes);
+    if (minutes === 0) continue;
+    totalDisplacedMinutes += minutes;
+    cost += computeRescheduleCost(displacement.capture, minutes, args.referenceNow);
+  }
+
+  const overlapCostMinutes = Math.max(0, args.overlapMinutes ?? minutesClaimed);
+  const overlapSoftCost = schedulerConfig.overlap.softCostPerMinute * overlapCostMinutes;
+
+  const net = benefit - cost - overlapSoftCost;
+  const perMinuteGain = minutesClaimed > 0 ? net / minutesClaimed : 0;
+  const movedTasks = args.displacements.length;
+  const thresholds = {
+    base: schedulerConfig.preemption.baseThreshold + schedulerConfig.preemption.movePenalty * movedTasks,
+    gainPerMinute: schedulerConfig.preemption.gainPerMinuteThreshold,
+    movePenalty: schedulerConfig.preemption.movePenalty,
+  };
+  const meetsBaseThreshold = net >= thresholds.base;
+  const meetsGainPerMinuteThreshold = perMinuteGain >= thresholds.gainPerMinute;
+  const limitChecks = {
+    exceedsTaskCap: movedTasks > schedulerConfig.limits.maxMovedTasksPerRun,
+    exceedsMinuteCap: totalDisplacedMinutes > schedulerConfig.limits.maxTotalMinutesShifted,
+    maxMovedTasks: schedulerConfig.limits.maxMovedTasksPerRun,
+    maxMinutesShifted: schedulerConfig.limits.maxTotalMinutesShifted,
+  };
+  const allowed = meetsBaseThreshold && meetsGainPerMinuteThreshold && !limitChecks.exceedsTaskCap && !limitChecks.exceedsMinuteCap;
+
+  return {
+    targetPriority: {
+      score: priority.score,
+      perMinute: priority.perMinute,
+    },
+    benefit,
+    cost,
+    overlapCost: overlapSoftCost,
+    net,
+    perMinuteGain,
+    movedTasks,
+    totalDisplacedMinutes,
+    thresholds,
+    meetsBaseThreshold,
+    meetsGainPerMinuteThreshold,
+    allowed,
+    limitChecks,
+  };
 }

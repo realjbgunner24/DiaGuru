@@ -1,13 +1,16 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { computePriorityScore, type PriorityInput } from "../../../shared/priority.ts";
 import type { CalendarTokenRow, CaptureEntryRow, Database } from "../types.ts";
+import { replaceCaptureChunks, type ChunkRecord } from "./chunks.ts";
 import {
-  schedulerConfig,
   computePrioritySnapshot,
   computeRigidityScore,
+  evaluatePreemptionNetGain,
   logSchedulerEvent,
+  schedulerConfig,
+  type NetGainEvaluation,
+  type PreemptionDisplacement,
 } from "./scheduler-config.ts";
-import { replaceCaptureChunks } from "./chunks.ts";
-import { computePriorityScore, type PriorityInput } from "../../../shared/priority.ts";
 
 const GOOGLE_EVENTS = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
@@ -18,6 +21,13 @@ const SEARCH_DAYS = 7;
 const DAY_END_HOUR = 22;
 const SLOT_INCREMENT_MINUTES = 15;
 const STABILITY_WINDOW_MINUTES = 30;
+const DEFAULT_MIN_CHUNK_MINUTES = SLOT_INCREMENT_MINUTES;
+const TARGET_CHUNK_MINUTES = schedulerConfig.chunking.targetChunkMinutes;
+const ROUTINE_PRIORITY_RULES = {
+  sleep: { scaler: 0.7, cap: 70 },
+  meal: { scaler: 0.5, cap: 55 },
+} as const;
+type RoutineKind = keyof typeof ROUTINE_PRIORITY_RULES;
 
 export class ScheduleError extends Error {
   status: number;
@@ -75,6 +85,79 @@ type ConflictDecision = {
 };
 
 type PreferredSlot = { start: Date; end: Date };
+
+type OccupancySlotStatus = "free" | "external" | "diaguru";
+
+type OccupancySlot = {
+  start: Date;
+  end: Date;
+  status: OccupancySlotStatus;
+  eventId?: string;
+  captureId?: string;
+};
+
+type OccupancyStats = {
+  free: number;
+  external: number;
+  diaguru: number;
+  total: number;
+};
+
+type OccupancySegment = {
+  start: string;
+  end: string;
+  status: OccupancySlotStatus;
+  eventId?: string;
+  captureId?: string;
+};
+
+type OccupancyDaySummary = {
+  day: string;
+  stats: OccupancyStats;
+  segments: OccupancySegment[];
+};
+
+type OccupancyGrid = {
+  start: Date;
+  end: Date;
+  slotMinutes: number;
+  stats: OccupancyStats;
+  slots: OccupancySlot[];
+  days: OccupancyDaySummary[];
+};
+
+type GridWindowCandidate = {
+  slot: PreferredSlot;
+  stats: {
+    totalMinutes: number;
+    freeMinutes: number;
+    diaguruMinutes: number;
+    externalMinutes: number;
+    diaguruBreakdown: Record<string, number>;
+    diaguruCount: number;
+  };
+  hasExternal: boolean;
+};
+
+type GridPreemptionChoice = {
+  slot: PreferredSlot;
+  conflicts: ConflictSummary[];
+  captureMap: Map<string, CaptureEntryRow>;
+  evaluation: NetGainEvaluation;
+};
+
+type ChunkPlacementResult = {
+  records: ChunkRecord[];
+  intervals: { start: Date; end: Date }[];
+};
+
+type SerializedChunk = {
+  start: string;
+  end: string;
+  late: boolean;
+  overlapped: boolean;
+  prime: boolean;
+};
 
 type SchedulingPlan = {
   mode: "flexible" | "deadline" | "window" | "start";
@@ -140,6 +223,76 @@ type PlanActionRecord = {
   next: CaptureSnapshot;
 };
 
+function logScheduleSummary(event: string, payload: Record<string, unknown>) {
+  logSchedulerEvent(event, payload);
+}
+
+function isRoutineKind(kind: string | null | undefined) {
+  if (!kind) return false;
+  return kind.startsWith("routine.");
+}
+
+function normalizeRoutineCapture(input: CaptureEntryRow, options: { referenceNow: Date; timezone?: string }) {
+  // Normalize sleep/meals into movable night/mealtime windows with soft start and no auto-freeze.
+  const capture = { ...input };
+  const tz = options.timezone ?? "UTC";
+
+  const refNow = options.referenceNow ?? new Date();
+  const baseDate = new Date(refNow);
+
+  const isSleep = capture.task_type_hint === "routine.sleep" || capture.extraction_kind === "routine.sleep";
+  const isMeal = capture.task_type_hint === "routine.meal" || capture.extraction_kind === "routine.meal";
+  const isRoutine = isSleep || isMeal || isRoutineKind(capture.task_type_hint);
+
+  if (!isRoutine) return capture;
+
+  const userLocked = Boolean(capture.manual_touch_at) || Boolean(capture.freeze_until);
+
+  if (isSleep) {
+    const nightStart = new Date(baseDate);
+    nightStart.setHours(22, 0, 0, 0);
+    const nightEnd = new Date(nightStart);
+    nightEnd.setDate(nightEnd.getDate() + 1);
+    nightEnd.setHours(7, 30, 0, 0);
+
+    // If existing window is day-time or missing, replace with night window.
+    capture.constraint_type = "window";
+    capture.window_start = capture.window_start ?? nightStart.toISOString();
+    capture.window_end = capture.window_end ?? nightEnd.toISOString();
+    capture.constraint_time = capture.window_start;
+    capture.constraint_end = capture.window_end;
+    capture.deadline_at = capture.deadline_at ?? capture.window_end;
+    capture.start_flexibility = "soft";
+    capture.duration_flexibility = "fixed";
+    capture.cannot_overlap = true;
+    capture.time_pref_time_of_day = capture.time_pref_time_of_day ?? "night";
+    if (!userLocked) {
+      capture.freeze_until = null;
+    }
+  } else if (isMeal) {
+    // Default meal window: 12:00-14:00 local if none provided.
+    if (!capture.window_start || !capture.window_end) {
+      const mealStart = new Date(baseDate);
+      mealStart.setHours(12, 0, 0, 0);
+      const mealEnd = new Date(mealStart);
+      mealEnd.setHours(14, 0, 0, 0);
+      capture.window_start = mealStart.toISOString();
+      capture.window_end = mealEnd.toISOString();
+      capture.constraint_type = "window";
+      capture.constraint_time = capture.window_start;
+      capture.constraint_end = capture.window_end;
+    }
+    capture.start_flexibility = capture.start_flexibility ?? "soft";
+    capture.duration_flexibility = capture.duration_flexibility ?? "fixed";
+    capture.cannot_overlap = capture.cannot_overlap ?? false;
+    if (!userLocked) {
+      capture.freeze_until = null;
+    }
+  }
+
+  return capture;
+}
+
 export async function handler(req: Request) {
   try {
     const auth = req.headers.get("Authorization");
@@ -177,6 +330,60 @@ export async function handler(req: Request) {
       .single();
     if (captureError || !capture) return json({ error: "Capture not found" }, 404);
     if (capture.user_id !== userId) return json({ error: "Forbidden" }, 403);
+
+    logScheduleSummary("schedule.request", {
+      captureId: capture.id,
+      content: capture.content,
+      estimatedMinutes: capture.estimated_minutes,
+      urgency: capture.urgency,
+      impact: capture.impact,
+      reschedulePenalty: capture.reschedule_penalty,
+      blocking: capture.blocking,
+      cannotOverlap: capture.cannot_overlap,
+      startFlexibility: capture.start_flexibility,
+      durationFlexibility: capture.duration_flexibility,
+      constraint: {
+        type: capture.constraint_type,
+        time: capture.constraint_time,
+        end: capture.constraint_end,
+        deadline: capture.deadline_at,
+        windowStart: capture.window_start,
+        windowEnd: capture.window_end,
+      },
+      scheduledFor: capture.scheduled_for,
+      freezeUntil: capture.freeze_until,
+      extractionKind: capture.extraction_kind,
+    });
+
+    // Normalize routines on the fly (sleep/meals) before scheduling.
+    const normalizedCapture = normalizeRoutineCapture(capture as CaptureEntryRow, {
+      referenceNow: now,
+      timezone: timezone ?? undefined,
+    });
+    if (normalizedCapture !== capture) {
+      await admin.from("capture_entries").update({
+        constraint_type: normalizedCapture.constraint_type,
+        constraint_time: normalizedCapture.constraint_time,
+        constraint_end: normalizedCapture.constraint_end,
+        window_start: normalizedCapture.window_start,
+        window_end: normalizedCapture.window_end,
+        start_flexibility: normalizedCapture.start_flexibility,
+        duration_flexibility: normalizedCapture.duration_flexibility,
+        cannot_overlap: normalizedCapture.cannot_overlap,
+        time_pref_time_of_day: normalizedCapture.time_pref_time_of_day,
+        freeze_until: normalizedCapture.freeze_until,
+      }).eq("id", capture.id);
+      capture.constraint_type = normalizedCapture.constraint_type;
+      capture.constraint_time = normalizedCapture.constraint_time;
+      capture.constraint_end = normalizedCapture.constraint_end;
+      capture.window_start = normalizedCapture.window_start;
+      capture.window_end = normalizedCapture.window_end;
+      capture.start_flexibility = normalizedCapture.start_flexibility;
+      capture.duration_flexibility = normalizedCapture.duration_flexibility;
+      capture.cannot_overlap = normalizedCapture.cannot_overlap;
+      capture.time_pref_time_of_day = normalizedCapture.time_pref_time_of_day;
+      capture.freeze_until = normalizedCapture.freeze_until;
+    }
 
     const calendarClient = await resolveCalendarClient(admin, userId, clientId, clientSecret);
     if (!calendarClient) {
@@ -238,22 +445,32 @@ export async function handler(req: Request) {
       return json({ error: "Capture already completed." }, 400);
     }
 
-    const allowOverlap = Boolean(body.allowOverlap);
+    const allowOverlap = body.allowOverlap === undefined
+      ? Boolean(schedulerConfig.overlap.enabled)
+      : Boolean(body.allowOverlap);
+    const allowLatePlacement = Boolean(
+      body.allowLatePlacement ?? body.allowLate ?? body.scheduleLate ?? false,
+    );
     const preferredStartIso = typeof body.preferredStart === "string" ? body.preferredStart : null;
     const preferredEndIso = typeof body.preferredEnd === "string" ? body.preferredEnd : null;
     const timezone = typeof body.timezone === "string" ? body.timezone : null;
     const offsetMinutes = timezoneOffsetMinutes ?? 0;
+    const now = new Date();
 
     const durationMinutes = Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
-    const now = new Date();
     const planId = crypto.randomUUID();
     const planActions: PlanActionRecord[] = [];
     let planRunCreated = false;
 
-    const prioritySnapshot = computePrioritySnapshot(capture as CaptureEntryRow, now);
+    let prioritySnapshot = computePrioritySnapshot(capture as CaptureEntryRow, now);
     const rigidityScore = computeRigidityScore(capture as CaptureEntryRow, now);
+    const routineKind = detectRoutineKind(capture as CaptureEntryRow);
+    if (routineKind) {
+      prioritySnapshot = applyRoutinePrioritySnapshot(prioritySnapshot, routineKind, durationMinutes);
+    }
     logSchedulerEvent("capture.metrics", {
       captureId: capture.id,
+      routineKind,
       priority: prioritySnapshot.score,
       perMinute: Number(prioritySnapshot.perMinute.toFixed(3)),
       rigidity: Number(rigidityScore.toFixed(2)),
@@ -294,6 +511,22 @@ export async function handler(req: Request) {
     let events = await google.listEvents(timeMin, timeMax);
     let eventsById = new Map(events.map((event) => [event.id, event]));
     let busyIntervals = computeBusyIntervals(events);
+    const occupancyGrid = buildOccupancyGrid({
+      events,
+      offsetMinutes,
+      referenceNow: now,
+    });
+    const overlapUsage = new Map<string, number>();
+    logSchedulerEvent("occupancy.grid", {
+      captureId: capture.id,
+      range: {
+        start: occupancyGrid.start.toISOString(),
+        end: occupancyGrid.end.toISOString(),
+      },
+      slotMinutes: occupancyGrid.slotMinutes,
+      stats: occupancyGrid.stats,
+      days: occupancyGrid.days,
+    });
 
     const requestPreferred = preferredStartIso
       ? parsePreferredSlot(preferredStartIso, preferredEndIso, durationMinutes)
@@ -301,15 +534,84 @@ export async function handler(req: Request) {
 
     const plan = computeSchedulingPlan(capture, durationMinutes, offsetMinutes, now);
     const capturePriority = priorityForCapture(capture, now);
+    const enforceWorkingWindow = shouldEnforceWorkingWindow(capture as CaptureEntryRow);
     const preferredSlot = requestPreferred ?? plan.preferredSlot;
+    const resolvedDeadline = plan.deadline ?? resolveDeadlineFromCapture(capture, offsetMinutes);
+    const scheduleWindowStart = plan.window?.start
+      ? new Date(Math.max(plan.window.start.getTime(), now.getTime()))
+      : now;
+    const primaryWindowEnd = plan.window?.end ?? resolvedDeadline ?? occupancyGrid.end;
+    const scheduleWindowEnd =
+      primaryWindowEnd.getTime() >= scheduleWindowStart.getTime()
+        ? primaryWindowEnd
+        : scheduleWindowStart;
+    const windowSummary = resolvedDeadline
+      ? summarizeWindowCapacity(occupancyGrid, scheduleWindowStart, scheduleWindowEnd)
+      : null;
+    const deadlineElapsed =
+      resolvedDeadline && resolvedDeadline.getTime() <= scheduleWindowStart.getTime();
+    const initialLateCandidate = resolvedDeadline
+      ? findLatePlacementSlot({
+        busyIntervals,
+        durationMinutes,
+        offsetMinutes,
+        referenceNow: now,
+        startFrom: scheduleWindowEnd,
+        enforceWorkingWindow,
+      })
+      : null;
+
+    logSchedulerEvent("plan.summary", {
+      captureId: capture.id,
+      mode: plan.mode,
+      preferredSlot: preferredSlot
+        ? { start: preferredSlot.start.toISOString(), end: preferredSlot.end.toISOString() }
+        : null,
+      deadline: resolvedDeadline ? resolvedDeadline.toISOString() : null,
+      windowStart: scheduleWindowStart.toISOString(),
+      windowEnd: scheduleWindowEnd.toISOString(),
+    });
+    if (deadlineElapsed && resolvedDeadline) {
+      if (allowLatePlacement && initialLateCandidate) {
+        return await scheduleLatePlacementResponse({
+          capture: capture as CaptureEntryRow,
+          slot: initialLateCandidate,
+          admin,
+          google,
+          planId,
+          capturePriority,
+          busyIntervals,
+          recordPlanAction,
+          finalizePlan,
+          schedulingNote: "Scheduled after missed deadline (user override).",
+          responseMessage: "Capture scheduled after missed deadline (marked late).",
+        });
+      }
+
+      return json(
+        buildDeadlineFailurePayload({
+          capture,
+          durationMinutes,
+          deadline: resolvedDeadline,
+          windowStart: scheduleWindowStart,
+          windowEnd: resolvedDeadline,
+          windowSummary,
+          lateCandidate: initialLateCandidate,
+          reason: "slot_exceeds_deadline",
+        }),
+        409,
+      );
+    }
 
     if (preferredSlot) {
-      const withinWorkingHours = isSlotWithinWorkingWindow(preferredSlot, offsetMinutes);
+      const withinWorkingHours = enforceWorkingWindow
+        ? isSlotWithinWorkingWindow(preferredSlot, offsetMinutes)
+        : true;
       const withinPlanWindow =
         plan.mode !== 'window' || !plan.window
           ? true
           : preferredSlot.start.getTime() >= plan.window.start.getTime() &&
-            preferredSlot.end.getTime() <= plan.window.end.getTime();
+          preferredSlot.end.getTime() <= plan.window.end.getTime();
       const slotWithinWindow = withinWorkingHours && withinPlanWindow;
       const conflicts = collectConflictingEvents(preferredSlot, events);
       const externalConflicts = conflicts.filter((conflict) => !conflict.diaGuru);
@@ -321,14 +623,9 @@ export async function handler(req: Request) {
       // Determine if overlap is actually allowed under policy
       let effectiveAllowOverlap = allowOverlap;
       if (effectiveAllowOverlap) {
-        // Must be inside working window
-        if (!slotWithinWindow) {
-          effectiveAllowOverlap = false;
-        } else if (externalConflicts.length > 0) {
-          // Never overlap external events
+        if (!slotWithinWindow || externalConflicts.length > 0) {
           effectiveAllowOverlap = false;
         } else {
-          // Respect cannot_overlap flags for current and conflicting DiaGuru captures
           const currentCannot = readCannotOverlapFromNotes(capture);
           if (currentCannot) {
             effectiveAllowOverlap = false;
@@ -344,11 +641,38 @@ export async function handler(req: Request) {
         }
       }
 
-      if (!effectiveAllowOverlap && (hasConflict || !slotWithinWindow)) {
+      if (hasConflict || !slotWithinWindow) {
+        if (
+          effectiveAllowOverlap &&
+          slotWithinWindow &&
+          hasConflict &&
+          externalConflicts.length === 0
+        ) {
+          const overlapResponse = await tryScheduleWithOverlap({
+            capture: capture as CaptureEntryRow,
+            slot: preferredSlot,
+            conflicts: diaGuruConflicts,
+            admin,
+            google,
+            planId,
+            capturePriority,
+            busyIntervals,
+            referenceNow: now,
+            recordPlanAction,
+            finalizePlan,
+            overlapUsage,
+            enforceWorkingWindow,
+          });
+          if (overlapResponse) {
+            return overlapResponse;
+          }
+        }
+
         const respondWithConflictDecision = async () => {
           const suggestion = findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, {
             startFrom: addMinutes(preferredSlot.end, SLOT_INCREMENT_MINUTES),
             referenceNow: now,
+            enforceWorkingWindow,
           });
           const llmConfig = resolveLlmConfig();
           const { decision, note } = await buildConflictDecision({
@@ -369,6 +693,27 @@ export async function handler(req: Request) {
             .update({ scheduling_notes: note })
             .eq("id", capture.id);
 
+          logScheduleSummary("schedule.conflict", {
+            captureId: capture.id,
+            content: capture.content,
+            preferredSlot: {
+              start: preferredSlot.start.toISOString(),
+              end: preferredSlot.end.toISOString(),
+              withinWindow: slotWithinWindow,
+            },
+            conflicts: conflicts.map((c) => ({
+              id: c.id,
+              summary: c.summary,
+              start: c.start,
+              end: c.end,
+              diaGuru: c.diaGuru,
+              captureId: c.captureId,
+            })),
+            suggestion,
+            reason: "preferred_conflict",
+            note,
+          });
+
           return json({
             message: decision.message,
             capture,
@@ -379,6 +724,7 @@ export async function handler(req: Request) {
         let captureMap: Map<string, CaptureEntryRow> | null = null;
         let selectedConflicts: ConflictSummary[] = [];
         let canRebalance = false;
+        let preemptionEvaluation: NetGainEvaluation | null = null;
 
         if (
           plan.mode !== "flexible" &&
@@ -427,6 +773,66 @@ export async function handler(req: Request) {
                   const idSet = new Set(preemptionPlan.ids);
                   selectedConflicts = movable.filter((conflict) => idSet.has(conflict.id));
                   canRebalance = selectedConflicts.length > 0;
+                  if (canRebalance && captureMap) {
+                    const displacements = buildPreemptionDisplacements(selectedConflicts, captureMap);
+                    if (displacements.length > 0) {
+                      const slotMinutes = Math.max(
+                        1,
+                        (preferredSlot.end.getTime() - preferredSlot.start.getTime()) / 60000,
+                      );
+                      const evaluation = evaluatePreemptionNetGain({
+                        target: capture,
+                        displacements,
+                        minutesClaimed: slotMinutes,
+                        referenceNow: now,
+                      });
+                      logSchedulerEvent("preemption.analysis", {
+                        captureId: capture.id,
+                        slotMinutes: Number(slotMinutes.toFixed(2)),
+                        displaced: displacements.map((disp) => ({
+                          captureId: disp.capture.id,
+                          minutes: Number(disp.minutes.toFixed(2)),
+                        })),
+                        evaluation: {
+                          benefit: Number(evaluation.benefit.toFixed(3)),
+                          cost: Number(evaluation.cost.toFixed(3)),
+                          overlapCost: Number(evaluation.overlapCost.toFixed(3)),
+                          net: Number(evaluation.net.toFixed(3)),
+                          perMinuteGain: Number(evaluation.perMinuteGain.toFixed(4)),
+                          movedTasks: evaluation.movedTasks,
+                          totalDisplacedMinutes: Number(
+                            evaluation.totalDisplacedMinutes.toFixed(2),
+                          ),
+                          meetsBaseThreshold: evaluation.meetsBaseThreshold,
+                          meetsGainPerMinuteThreshold: evaluation.meetsGainPerMinuteThreshold,
+                          allowed: evaluation.allowed,
+                          thresholds: evaluation.thresholds,
+                          limitChecks: evaluation.limitChecks,
+                          targetPriority: evaluation.targetPriority,
+                        },
+                      });
+                      if (evaluation.allowed) {
+                        preemptionEvaluation = evaluation;
+                      } else {
+                        logSchedulerEvent("preemption.rejected", {
+                          captureId: capture.id,
+                          reason: "net_gain_threshold",
+                          evaluation: {
+                            net: Number(evaluation.net.toFixed(3)),
+                            perMinuteGain: Number(evaluation.perMinuteGain.toFixed(4)),
+                            meetsBaseThreshold: evaluation.meetsBaseThreshold,
+                            meetsGainPerMinuteThreshold: evaluation.meetsGainPerMinuteThreshold,
+                            limitChecks: evaluation.limitChecks,
+                          },
+                        });
+                        canRebalance = false;
+                        selectedConflicts = [];
+                      }
+                    } else {
+                      canRebalance = false;
+                      selectedConflicts = [];
+                    }
+                  }
                 }
               }
             }
@@ -434,12 +840,12 @@ export async function handler(req: Request) {
         }
 
         if (canRebalance && selectedConflicts.length > 0 && captureMap) {
-        rescheduleQueue = await reclaimDiaGuruConflicts(selectedConflicts, google, admin, {
-          captureMap,
-          eventsById,
-          planId,
-          recordPlanAction,
-        });
+          rescheduleQueue = await reclaimDiaGuruConflicts(selectedConflicts, google, admin, {
+            captureMap,
+            eventsById,
+            planId,
+            recordPlanAction,
+          });
           if (rescheduleQueue.length > 0) {
             const removedIds = new Set(selectedConflicts.map((conflict) => conflict.id));
             events = events.filter((event) => !removedIds.has(event.id));
@@ -506,9 +912,9 @@ export async function handler(req: Request) {
 
       if (updateError) return json({ error: updateError.message }, 500);
 
-      await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
-        { start: preferredSlot.start, end: preferredSlot.end },
-      ]);
+      const chunkRecords = buildChunksForSlot(updated as CaptureEntryRow, preferredSlot);
+      await replaceCaptureChunks(admin, updated as CaptureEntryRow, chunkRecords);
+      const serializedChunks = serializeChunks(chunkRecords);
 
       await recordPlanAction({
         actionId,
@@ -520,12 +926,23 @@ export async function handler(req: Request) {
       });
 
       const planSummary = await finalizePlan();
+      logScheduleSummary("schedule.success", {
+        captureId: capture.id,
+        content: capture.content,
+        slot: { start: preferredSlot.start.toISOString(), end: preferredSlot.end.toISOString() },
+        overlap: null,
+        planId,
+        actionId,
+      });
       return json({
         message: "Capture scheduled.",
         capture: updated,
         planSummary,
+        chunks: serializedChunks,
       });
     }
+
+    const preferredTimeOfDay = derivePreferredTimeOfDayBands(capture as CaptureEntryRow);
 
     const candidate = scheduleWithPlan({
       plan,
@@ -534,85 +951,314 @@ export async function handler(req: Request) {
       offsetMinutes,
       referenceNow: now,
       isSoftStart: capture.is_soft_start,
+      enforceWorkingWindow,
+      preferredTimeOfDay,
     });
-    if (!candidate) {
-      // Fallback preemption attempt for deadline/window plans: try latest legal slot and rebalance DiaGuru tasks
-      if (plan.mode === "deadline" && plan.deadline) {
-        const latestStart = new Date(plan.deadline.getTime() - durationMinutes * 60000);
-        const preferredSlot = { start: new Date(Math.max(latestStart.getTime(), now.getTime())), end: plan.deadline };
-        // Validate working window
-        const withinWorkingHours = isSlotWithinWorkingWindow(preferredSlot, offsetMinutes);
-        if (withinWorkingHours && isSlotWithinConstraints(capture, preferredSlot)) {
-          const conflicts = collectConflictingEvents(preferredSlot, events);
-          const externalConflicts = conflicts.filter((c) => !c.diaGuru);
-          const diaGuruConflicts = conflicts.filter((c) => c.diaGuru && c.captureId);
-          if (conflicts.length > 0 && externalConflicts.length === 0 && diaGuruConflicts.length > 0) {
-            // Remove conflicting DiaGuru events and reschedule them after placing this urgent task
-            const conflictIds = new Set(diaGuruConflicts.map((c) => c.id));
-            events = events.filter((e) => !conflictIds.has(e.id));
-            eventsById = new Map(events.map((e) => [e.id, e]));
-            busyIntervals = computeBusyIntervals(events);
+    const candidateWithinWindow =
+      candidate &&
+      candidate.start.getTime() >= scheduleWindowStart.getTime() &&
+      candidate.end.getTime() <= scheduleWindowEnd.getTime();
+    const validCandidate = candidateWithinWindow ? candidate : null;
+    if (candidate && !candidateWithinWindow) {
+      logSchedulerEvent("plan.discardedCandidate", {
+        captureId: capture.id,
+        candidate: { start: candidate.start.toISOString(), end: candidate.end.toISOString() },
+        windowStart: scheduleWindowStart.toISOString(),
+        windowEnd: scheduleWindowEnd.toISOString(),
+      });
+    }
+    if (!validCandidate) {
+      const searchWindowStart = scheduleWindowStart;
+      const searchWindowEnd = scheduleWindowEnd;
+      const canScanWindow = searchWindowEnd.getTime() > searchWindowStart.getTime();
+      const gridCandidates = canScanWindow
+        ? collectGridWindowCandidates({
+          grid: occupancyGrid,
+          durationMinutes,
+          windowStart: searchWindowStart,
+          windowEnd: searchWindowEnd,
+          referenceNow: now,
+          limit: 6,
+        })
+        : [];
+      logSchedulerEvent("grid.windowScan", {
+        captureId: capture.id,
+        requestedMinutes: durationMinutes,
+        windowStart: searchWindowStart.toISOString(),
+        windowEnd: searchWindowEnd.toISOString(),
+        totalCandidates: gridCandidates.length,
+        top: gridCandidates.slice(0, 5).map((entry) => ({
+          start: entry.slot.start.toISOString(),
+          end: entry.slot.end.toISOString(),
+          stats: entry.stats,
+          hasExternal: entry.hasExternal,
+        })),
+      });
 
-            const actionId = crypto.randomUUID();
-            const prevSnapshot = snapshotFromRow(capture);
-            const createdEvent = await google.createEvent({ capture, slot: preferredSlot, planId, actionId, priorityScore: capturePriority });
-            registerInterval(busyIntervals, preferredSlot);
+      let directSlot: PreferredSlot | null = null;
+      if (resolvedDeadline && canScanWindow) {
+        const chunkDurations = generateChunkDurations({
+          totalMinutes: durationMinutes,
+          minChunkMinutes: capture.min_chunk_minutes ?? DEFAULT_MIN_CHUNK_MINUTES,
+          maxSplits: capture.max_splits ?? null,
+          allowSplitting: capture.duration_flexibility === "split_allowed",
+        });
+        const placement = placeChunksWithinRange({
+          chunkDurations,
+          busyIntervals,
+          offsetMinutes,
+          rangeStart: searchWindowStart,
+          rangeEnd: searchWindowEnd,
+          enforceWorkingWindow,
+        });
+        if (placement && placement.records.length > 0) {
+          directSlot = {
+            start: placement.records[0].start,
+            end: placement.records[placement.records.length - 1].end,
+          };
+        }
+      }
 
-            // Load capture rows and attempt reschedule of displaced captures
-            const conflictMap = await loadConflictCaptures(admin, diaGuruConflicts);
-            const toReschedule = Array.from(conflictMap.values());
-            if (toReschedule.length > 0) {
-              await rescheduleCaptures({ captures: toReschedule, admin, busyIntervals, offsetMinutes, referenceNow: now, google, planId, recordPlanAction });
-            }
+      if (directSlot) {
+        logSchedulerEvent("deadline.directPlacement", {
+          captureId: capture.id,
+          slot: { start: directSlot.start.toISOString(), end: directSlot.end.toISOString() },
+        });
+        const actionId = crypto.randomUUID();
+        const prevSnapshot = snapshotFromRow(capture);
+        const createdEvent = await google.createEvent({
+          capture,
+          slot: directSlot,
+          planId,
+          actionId,
+          priorityScore: capturePriority,
+        });
+        registerInterval(busyIntervals, directSlot);
 
-            const { data: updated, error: updateError } = await admin
-              .from("capture_entries")
-              .update({
-                status: "scheduled",
-                planned_start: preferredSlot.start.toISOString(),
-                planned_end: preferredSlot.end.toISOString(),
-                scheduled_for: preferredSlot.start.toISOString(),
-                calendar_event_id: createdEvent.id,
-                calendar_event_etag: createdEvent.etag,
-                plan_id: planId,
-                freeze_until: null,
-                scheduling_notes: "Scheduled at latest legal slot; rebalanced DiaGuru sessions.",
-              })
-              .eq("id", capture.id)
-              .select("*")
-              .single();
-            if (updateError) return json({ error: updateError.message }, 500);
+        const { data: scheduledCapture, error: scheduleUpdateError } = await admin
+          .from("capture_entries")
+          .update({
+            status: "scheduled",
+            planned_start: directSlot.start.toISOString(),
+            planned_end: directSlot.end.toISOString(),
+            scheduled_for: directSlot.start.toISOString(),
+            calendar_event_id: createdEvent.id,
+            calendar_event_etag: createdEvent.etag,
+            plan_id: planId,
+            freeze_until: null,
+            scheduling_notes: "Scheduled within deadline window.",
+          })
+          .eq("id", capture.id)
+          .select("*")
+          .single();
 
-            if (updated) {
-              await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
-                { start: preferredSlot.start, end: preferredSlot.end },
-              ]);
-            }
+        if (scheduleUpdateError) {
+          throw new ScheduleError("Failed to persist scheduled capture after window placement.", 500, scheduleUpdateError);
+        }
 
-            await recordPlanAction({
-              actionId,
-              captureId: capture.id,
-              captureContent: capture.content,
-              actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
-              prev: prevSnapshot,
-              next: snapshotFromRow(updated as CaptureEntryRow),
+        const chunkRecords = buildChunksForSlot(scheduledCapture as CaptureEntryRow, directSlot);
+        await replaceCaptureChunks(admin, scheduledCapture as CaptureEntryRow, chunkRecords);
+        const serializedChunks = serializeChunks(chunkRecords);
+
+        await recordPlanAction({
+          actionId,
+          captureId: capture.id,
+          captureContent: capture.content,
+          actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+          prev: prevSnapshot,
+          next: snapshotFromRow(scheduledCapture as CaptureEntryRow),
+        });
+
+        const planSummary = await finalizePlan();
+        return json({
+          message: "Capture scheduled within deadline window.",
+          capture: scheduledCapture,
+          planSummary,
+          chunks: serializedChunks,
+        });
+      }
+
+      const gridChoice = await pickGridPreemptionCandidate({
+        candidates: gridCandidates,
+        events,
+        capture,
+        capturePriority,
+        admin,
+        referenceNow: now,
+        offsetMinutes,
+      });
+
+      if (gridChoice) {
+        const rescheduleQueue = await reclaimDiaGuruConflicts(gridChoice.conflicts, google, admin, {
+          captureMap: gridChoice.captureMap,
+          eventsById,
+          planId,
+          recordPlanAction,
+        });
+
+        if (rescheduleQueue.length > 0) {
+          const removedIds = new Set(gridChoice.conflicts.map((conflict) => conflict.id));
+          events = events.filter((event) => !removedIds.has(event.id));
+          eventsById = new Map(events.map((event) => [event.id, event]));
+          busyIntervals = computeBusyIntervals(events);
+
+          const actionId = crypto.randomUUID();
+          const prevSnapshot = snapshotFromRow(capture);
+          const createdEvent = await google.createEvent({
+            capture,
+            slot: gridChoice.slot,
+            planId,
+            actionId,
+            priorityScore: capturePriority,
+          });
+          registerInterval(busyIntervals, gridChoice.slot);
+
+          await rescheduleCaptures({
+            captures: rescheduleQueue,
+            admin,
+            busyIntervals,
+            offsetMinutes,
+            referenceNow: now,
+            google,
+            planId,
+            recordPlanAction,
+          });
+
+          const { data: scheduledCapture, error: scheduleUpdateError } = await admin
+            .from("capture_entries")
+            .update({
+              status: "scheduled",
+              planned_start: gridChoice.slot.start.toISOString(),
+              planned_end: gridChoice.slot.end.toISOString(),
+              scheduled_for: gridChoice.slot.start.toISOString(),
+              calendar_event_id: createdEvent.id,
+              calendar_event_etag: createdEvent.etag,
+              plan_id: planId,
+              freeze_until: null,
+              scheduling_notes: "Scheduled via prioritized rebalancing window.",
+            })
+            .eq("id", capture.id)
+            .select("*")
+            .single();
+
+          if (scheduleUpdateError) {
+            throw new ScheduleError("Failed to persist scheduled capture after grid preemption.", 500, scheduleUpdateError);
+          }
+
+          const chunkRecords = buildChunksForSlot(scheduledCapture as CaptureEntryRow, gridChoice.slot);
+          await replaceCaptureChunks(admin, scheduledCapture as CaptureEntryRow, chunkRecords);
+          const serializedChunks = serializeChunks(chunkRecords);
+
+          await recordPlanAction({
+            actionId,
+            captureId: capture.id,
+            captureContent: capture.content,
+            actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+            prev: prevSnapshot,
+            next: snapshotFromRow(scheduledCapture as CaptureEntryRow),
+          });
+
+          const planSummary = await finalizePlan();
+          logSchedulerEvent("grid.preemption.commit", {
+            captureId: capture.id,
+            slot: { start: gridChoice.slot.start.toISOString(), end: gridChoice.slot.end.toISOString() },
+            evaluation: gridChoice.evaluation,
+            rescheduledCount: rescheduleQueue.length,
+          });
+
+          return json({
+            message: "Capture scheduled via prioritized rebalancing.",
+            capture: scheduledCapture,
+            planSummary,
+            chunks: serializedChunks,
+          });
+        } else {
+          logSchedulerEvent("grid.preemption.abort", {
+            captureId: capture.id,
+            reason: "reclaim_failed",
+          });
+        }
+      }
+
+      const hardDeadline = Boolean(resolvedDeadline) && capture.constraint_type === "deadline_time";
+      if (!hardDeadline && resolvedDeadline) {
+        const capacityThreshold = Math.max(
+          capture.min_chunk_minutes ?? DEFAULT_MIN_CHUNK_MINUTES,
+          Math.ceil(0.25 * durationMinutes),
+        );
+        const preCapacity = windowSummary?.freeMinutes ?? 0;
+        if (preCapacity < capacityThreshold) {
+          const lateSlot = findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, {
+            startFrom: scheduleWindowEnd,
+            referenceNow: now,
+            enforceWorkingWindow,
+          });
+          if (lateSlot) {
+            return await scheduleLatePlacementResponse({
+              capture: capture as CaptureEntryRow,
+              slot: lateSlot,
+              admin,
+              google,
+              planId,
+              capturePriority,
+              busyIntervals,
+              recordPlanAction,
+              finalizePlan,
+              schedulingNote: "Scheduled after soft deadline; marked late.",
+              responseMessage: "Capture scheduled after soft deadline (marked late).",
             });
-
-            const planSummary = await finalizePlan();
-            return json({ message: "Capture scheduled via preemption.", capture: updated, planSummary });
           }
         }
       }
-      // No legal slot available. Return detailed reason for client logging.
-      const deadlineIso = capture.deadline_at ?? capture.window_end ?? capture.constraint_end ?? (capture.constraint_type === "deadline_time" ? capture.constraint_time : null);
+
+      const fallbackLateCandidate = resolvedDeadline
+        ? findLatePlacementSlot({
+          busyIntervals,
+          durationMinutes,
+          offsetMinutes,
+          referenceNow: now,
+          startFrom: scheduleWindowEnd,
+          enforceWorkingWindow,
+        })
+        : null;
+
+      if (resolvedDeadline) {
+        if (allowLatePlacement && fallbackLateCandidate) {
+          return await scheduleLatePlacementResponse({
+            capture: capture as CaptureEntryRow,
+            slot: fallbackLateCandidate,
+            admin,
+            google,
+            planId,
+            capturePriority,
+            busyIntervals,
+            recordPlanAction,
+            finalizePlan,
+            schedulingNote: "Scheduled after missed deadline (user override).",
+            responseMessage: "Capture scheduled after missed deadline (marked late).",
+          });
+        }
+
+        return json(
+          buildDeadlineFailurePayload({
+            capture,
+            durationMinutes,
+            deadline: resolvedDeadline,
+            windowStart: scheduleWindowStart,
+            windowEnd: scheduleWindowEnd,
+            windowSummary,
+            lateCandidate: fallbackLateCandidate,
+            reason: "no_slot",
+          }),
+          409,
+        );
+      }
       return json(
         {
           error: "No available slot within constraints.",
           reason: "no_slot",
           capture_id: capture.id,
-          mode: plan.mode,
           duration_minutes: durationMinutes,
-          deadline: deadlineIso,
           reference_now: now.toISOString(),
         },
         409,
@@ -622,13 +1268,13 @@ export async function handler(req: Request) {
     const autoActionId = crypto.randomUUID();
     const prevSnapshot = snapshotFromRow(capture);
     // Hard guard: ensure slot respects deadline/window
-    if (!isSlotWithinConstraints(capture, candidate)) {
+    if (!isSlotWithinConstraints(capture, validCandidate)) {
       return json(
         {
           error: "Found slot exceeds deadline/window.",
           reason: "slot_exceeds_deadline",
           capture_id: capture.id,
-          slot: { start: candidate.start.toISOString(), end: candidate.end.toISOString() },
+          slot: { start: validCandidate.start.toISOString(), end: validCandidate.end.toISOString() },
           deadline: capture.deadline_at ?? capture.window_end ?? capture.constraint_end ?? (capture.constraint_type === "deadline_time" ? capture.constraint_time : null),
         },
         409,
@@ -636,7 +1282,7 @@ export async function handler(req: Request) {
     }
     const createdEvent = await google.createEvent({
       capture,
-      slot: candidate,
+      slot: validCandidate,
       planId,
       actionId: autoActionId,
       priorityScore: capturePriority,
@@ -646,25 +1292,26 @@ export async function handler(req: Request) {
       .from("capture_entries")
       .update({
         status: "scheduled",
-          planned_start: candidate.start.toISOString(),
-          planned_end: candidate.end.toISOString(),
-          scheduled_for: candidate.start.toISOString(),
-          calendar_event_id: createdEvent.id,
-          calendar_event_etag: createdEvent.etag,
-          plan_id: planId,
-          freeze_until: null,
-          scheduling_notes: `Scheduled automatically with ${BUFFER_MINUTES} minute buffer.`,
-        })
+        planned_start: validCandidate.start.toISOString(),
+        planned_end: validCandidate.end.toISOString(),
+        scheduled_for: validCandidate.start.toISOString(),
+        calendar_event_id: createdEvent.id,
+        calendar_event_etag: createdEvent.etag,
+        plan_id: planId,
+        freeze_until: null,
+        scheduling_notes: `Scheduled automatically with ${BUFFER_MINUTES} minute buffer.`,
+      })
       .eq("id", capture.id)
       .select("*")
       .single();
 
     if (updateError) return json({ error: updateError.message }, 500);
 
+    let serializedChunks: SerializedChunk[] = [];
     if (updated) {
-      await replaceCaptureChunks(admin, updated as CaptureEntryRow, [
-        { start: candidate.start, end: candidate.end },
-      ]);
+      const chunkRecords = buildChunksForSlot(updated as CaptureEntryRow, validCandidate);
+      await replaceCaptureChunks(admin, updated as CaptureEntryRow, chunkRecords);
+      serializedChunks = serializeChunks(chunkRecords);
     }
 
     await recordPlanAction({
@@ -681,6 +1328,7 @@ export async function handler(req: Request) {
       message: "Capture scheduled.",
       capture: updated,
       planSummary,
+      chunks: serializedChunks,
     });
   } catch (error) {
     if (error instanceof ScheduleError) {
@@ -779,14 +1427,76 @@ function findNextAvailableSlot(
   intervals: { start: Date; end: Date }[],
   durationMinutes: number,
   offsetMinutes: number,
-  options: { startFrom?: Date; referenceNow?: Date } = {},
+  options: {
+    startFrom?: Date;
+    referenceNow?: Date;
+    enforceWorkingWindow?: boolean;
+    preferredTimeOfDay?: { start: number; end: number }[];
+  } = {},
 ) {
   const referenceNow = options.referenceNow ?? new Date();
+  const enforceWorkingWindow = options.enforceWorkingWindow ?? true;
   intervals.sort((a, b) => a.start.getTime() - b.start.getTime());
 
   let cursor = options.startFrom
     ? new Date(Math.max(options.startFrom.getTime(), referenceNow.getTime()))
     : addMinutes(referenceNow, 5);
+
+  const searchWindow = (start: Date, end: Date) => {
+    let candidateStart = new Date(start.getTime());
+    const limit = end.getTime();
+    const durationMs = durationMinutes * 60000;
+
+    while (candidateStart.getTime() + durationMs <= limit) {
+      const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+      if (isSlotFree(candidateStart, candidateEnd, intervals)) {
+        return { start: candidateStart, end: candidateEnd };
+      }
+      candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
+    }
+    return null;
+  };
+
+  // Pass 1: Preferred windows
+  if (options.preferredTimeOfDay && options.preferredTimeOfDay.length > 0) {
+    for (let day = 0; day < SEARCH_DAYS; day++) {
+      const dayAnchor = addDays(referenceNow, day);
+      // Calculate midnight for the day
+      const local = toLocalDate(dayAnchor, offsetMinutes);
+      local.setHours(0, 0, 0, 0);
+      const dayStartMidnight = toUtcDate(local, offsetMinutes);
+
+      for (const pref of options.preferredTimeOfDay) {
+        const windowStart = addMinutes(dayStartMidnight, pref.start * 60);
+        const windowEnd = addMinutes(dayStartMidnight, pref.end * 60);
+
+        // Clip to cursor
+        const effectiveStart = new Date(Math.max(windowStart.getTime(), cursor.getTime()));
+        const effectiveEnd = windowEnd;
+
+        if (effectiveStart.getTime() >= effectiveEnd.getTime()) continue;
+
+        const slot = searchWindow(effectiveStart, effectiveEnd);
+        if (slot) return slot;
+      }
+    }
+  }
+
+  // Pass 2: Standard search
+  if (!enforceWorkingWindow) {
+    const maxSearchMinutes = SEARCH_DAYS * 24 * 60;
+    let candidateStart = new Date(cursor.getTime());
+    const limit = candidateStart.getTime() + maxSearchMinutes * 60000;
+    const durationMs = durationMinutes * 60000;
+    while (candidateStart.getTime() + durationMs <= limit) {
+      const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+      if (isSlotFree(candidateStart, candidateEnd, intervals)) {
+        return { start: candidateStart, end: candidateEnd };
+      }
+      candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
+    }
+    return null;
+  }
 
   if (isBeforeDayStart(cursor, offsetMinutes)) {
     cursor = startOfDayOffset(referenceNow, offsetMinutes);
@@ -830,6 +1540,859 @@ function computeBusyIntervals(events: CalendarEvent[], bufferMinutes = BUFFER_MI
 
   intervals.sort((a, b) => a.start.getTime() - b.start.getTime());
   return intervals;
+}
+
+function buildOccupancyGrid(args: {
+  events: CalendarEvent[];
+  offsetMinutes: number;
+  referenceNow: Date;
+  days?: number;
+}): OccupancyGrid {
+  const slotMinutes = SLOT_INCREMENT_MINUTES;
+  const slotMs = slotMinutes * 60000;
+  const totalDays = Math.max(1, Math.min(SEARCH_DAYS, args.days ?? SEARCH_DAYS));
+  const { startHour, endHour } = schedulerConfig.workingWindow;
+  const localNow = toLocalDate(args.referenceNow, args.offsetMinutes);
+  const localStart = new Date(localNow.getTime());
+  localStart.setUTCHours(startHour, 0, 0, 0);
+  if (localNow.getUTCHours() >= endHour) {
+    localStart.setUTCDate(localStart.getUTCDate() + 1);
+  }
+
+  const gridStart = toUtcDate(localStart, args.offsetMinutes);
+  const localGridEnd = new Date(localStart.getTime());
+  localGridEnd.setUTCDate(localGridEnd.getUTCDate() + totalDays - 1);
+  localGridEnd.setUTCHours(endHour, 0, 0, 0);
+  const gridEnd = toUtcDate(localGridEnd, args.offsetMinutes);
+
+  const eventWindows = args.events
+    .map((event) => {
+      const start = parseEventDate(event.start);
+      const end = parseEventDate(event.end);
+      if (!start || !end) return null;
+      if (end.getTime() <= gridStart.getTime() || start.getTime() >= gridEnd.getTime()) {
+        return null;
+      }
+      const isDiaGuru = event.extendedProperties?.private?.diaGuru === "true";
+      const captureId = event.extendedProperties?.private?.capture_id ?? null;
+      return { start, end, isDiaGuru, captureId, id: event.id };
+    })
+    .filter(Boolean) as {
+      start: Date;
+      end: Date;
+      isDiaGuru: boolean;
+      captureId: string | null;
+      id: string;
+    }[];
+
+  const allSlots: OccupancySlot[] = [];
+  const daySummaries: OccupancyDaySummary[] = [];
+
+  for (let day = 0; day < totalDays; day++) {
+    const dayStartLocal = new Date(localStart.getTime());
+    dayStartLocal.setUTCDate(dayStartLocal.getUTCDate() + day);
+    const dayEndLocal = new Date(dayStartLocal.getTime());
+    dayEndLocal.setUTCHours(endHour, 0, 0, 0);
+    const dayStartUtc = toUtcDate(dayStartLocal, args.offsetMinutes);
+    const dayEndUtc = toUtcDate(dayEndLocal, args.offsetMinutes);
+
+    const daySlots: OccupancySlot[] = [];
+    for (let cursor = new Date(dayStartUtc.getTime()); cursor.getTime() < dayEndUtc.getTime(); cursor = new Date(cursor.getTime() + slotMs)) {
+      const slotEnd = new Date(cursor.getTime() + slotMs);
+      let status: OccupancySlotStatus = "free";
+      let eventId: string | undefined;
+      let captureId: string | undefined;
+
+      for (const event of eventWindows) {
+        if (event.start.getTime() >= slotEnd.getTime()) continue;
+        if (event.end.getTime() <= cursor.getTime()) continue;
+        status = event.isDiaGuru ? "diaguru" : "external";
+        eventId = event.id;
+        captureId = event.captureId ?? undefined;
+        if (event.isDiaGuru) break;
+      }
+
+      daySlots.push({ start: new Date(cursor.getTime()), end: slotEnd, status, eventId, captureId });
+    }
+
+    const dayStats = summarizeSlotStats(daySlots);
+    const segments = compressOccupancySegments(daySlots);
+    const label = formatLocalDayLabel(dayStartUtc, args.offsetMinutes);
+    daySummaries.push({ day: label, stats: dayStats, segments });
+    allSlots.push(...daySlots);
+  }
+
+  return {
+    start: gridStart,
+    end: gridEnd,
+    slotMinutes,
+    stats: summarizeSlotStats(allSlots),
+    slots: allSlots,
+    days: daySummaries,
+  };
+}
+
+function collectGridWindowCandidates(args: {
+  grid: OccupancyGrid;
+  durationMinutes: number;
+  windowStart?: Date | null;
+  windowEnd?: Date | null;
+  referenceNow: Date;
+  limit?: number;
+}): GridWindowCandidate[] {
+  const { grid } = args;
+  const slotMinutes = Math.max(1, grid.slotMinutes);
+  const slotsNeeded = Math.max(1, Math.ceil(args.durationMinutes / slotMinutes));
+  if (grid.slots.length === 0) return [];
+
+  const rangeStart = Math.max(
+    grid.start.getTime(),
+    args.referenceNow.getTime(),
+    args.windowStart ? args.windowStart.getTime() : grid.start.getTime(),
+  );
+  const rangeEnd = Math.min(
+    grid.end.getTime(),
+    args.windowEnd ? args.windowEnd.getTime() : grid.end.getTime(),
+  );
+  if (rangeStart >= rangeEnd) return [];
+
+  const results: GridWindowCandidate[] = [];
+  for (let i = 0; i < grid.slots.length; i++) {
+    const slot = grid.slots[i];
+    if (slot.start.getTime() < rangeStart) continue;
+    const lastIndex = i + slotsNeeded - 1;
+    if (lastIndex >= grid.slots.length) break;
+    const lastSlot = grid.slots[lastIndex];
+    if (lastSlot.end.getTime() > rangeEnd) break;
+
+    const candidate = analyzeGridWindow(grid.slots, i, slotsNeeded, slotMinutes);
+    results.push(candidate);
+    if (args.limit && results.length >= args.limit) break;
+  }
+
+  return results;
+}
+
+function analyzeGridWindow(
+  slots: OccupancySlot[],
+  startIndex: number,
+  size: number,
+  slotMinutes: number,
+): GridWindowCandidate {
+  const diaguruBreakdown = new Map<string, number>();
+  let freeMinutes = 0;
+  let diaguruMinutes = 0;
+  let externalMinutes = 0;
+
+  for (let i = 0; i < size; i++) {
+    const slot = slots[startIndex + i];
+    if (!slot) break;
+    if (slot.status === "free") {
+      freeMinutes += slotMinutes;
+    } else if (slot.status === "diaguru") {
+      diaguruMinutes += slotMinutes;
+      if (slot.captureId) {
+        const prev = diaguruBreakdown.get(slot.captureId) ?? 0;
+        diaguruBreakdown.set(slot.captureId, prev + slotMinutes);
+      }
+    } else if (slot.status === "external") {
+      externalMinutes += slotMinutes;
+    }
+  }
+
+  const startSlot = slots[startIndex];
+  const endSlot = slots[startIndex + size - 1];
+  const totalMinutes = freeMinutes + diaguruMinutes + externalMinutes;
+  return {
+    slot: { start: new Date(startSlot.start), end: new Date(endSlot.end) },
+    stats: {
+      totalMinutes,
+      freeMinutes,
+      diaguruMinutes,
+      externalMinutes,
+      diaguruBreakdown: Object.fromEntries(diaguruBreakdown.entries()),
+      diaguruCount: diaguruBreakdown.size,
+    },
+    hasExternal: externalMinutes > 0,
+  };
+}
+
+function generateChunkDurations(args: {
+  totalMinutes: number;
+  minChunkMinutes?: number | null;
+  maxSplits?: number | null;
+  allowSplitting: boolean;
+}): number[] {
+  const increment = SLOT_INCREMENT_MINUTES;
+  const totalMinutes = Math.max(increment, roundUpToIncrement(args.totalMinutes, increment));
+  if (!args.allowSplitting) return [totalMinutes];
+
+  const minChunkMinutes = Math.max(
+    increment,
+    roundUpToIncrement(args.minChunkMinutes ?? DEFAULT_MIN_CHUNK_MINUTES, increment),
+  );
+  const totalIncrements = Math.max(1, Math.ceil(totalMinutes / increment));
+  const minChunkIncrements = Math.max(1, Math.ceil(minChunkMinutes / increment));
+  const targetChunkIncrements = Math.max(
+    minChunkIncrements,
+    Math.ceil(TARGET_CHUNK_MINUTES / increment),
+  );
+
+  const maxChunksFromDuration = Math.floor(totalIncrements / minChunkIncrements);
+  if (maxChunksFromDuration <= 1) return [totalMinutes];
+
+  const maxSplits = typeof args.maxSplits === "number" && args.maxSplits > 0
+    ? Math.max(1, Math.floor(args.maxSplits))
+    : Infinity;
+  const cappedChunks = Math.min(maxChunksFromDuration, maxSplits);
+  if (cappedChunks <= 1) return [totalMinutes];
+
+  const roughCount = Math.ceil(totalIncrements / targetChunkIncrements);
+  let chunkCount = Math.max(1, Math.min(cappedChunks, roughCount));
+
+  while (chunkCount > 1 && Math.floor(totalIncrements / chunkCount) < minChunkIncrements) {
+    chunkCount -= 1;
+  }
+
+  const baseIncrements = Math.floor(totalIncrements / chunkCount);
+  let remainder = totalIncrements - baseIncrements * chunkCount;
+  const chunkIncrements = Array(chunkCount)
+    .fill(baseIncrements)
+    .map((value) => Math.max(value, minChunkIncrements));
+
+  let cursor = 0;
+  while (remainder > 0) {
+    const index = cursor % chunkIncrements.length;
+    chunkIncrements[index] += 1;
+    remainder -= 1;
+    cursor += 1;
+  }
+
+  return chunkIncrements.map((value) => value * increment);
+}
+
+function placeChunksWithinRange(args: {
+  chunkDurations: number[];
+  busyIntervals: { start: Date; end: Date }[];
+  offsetMinutes: number;
+  rangeStart: Date;
+  rangeEnd: Date;
+  enforceWorkingWindow?: boolean;
+}): ChunkPlacementResult | null {
+  if (args.chunkDurations.length === 0) {
+    return {
+      records: [],
+      intervals: args.busyIntervals.map((interval) => ({
+        start: new Date(interval.start),
+        end: new Date(interval.end),
+      })),
+    };
+  }
+  const intervals = args.busyIntervals.map((interval) => ({
+    start: new Date(interval.start),
+    end: new Date(interval.end),
+  }));
+  const placements: ChunkRecord[] = [];
+  let cursor = alignToSlotIncrement(args.rangeStart);
+
+  for (const minutes of args.chunkDurations) {
+    const slot = findSlotWithinRange(
+      intervals,
+      minutes,
+      args.offsetMinutes,
+      {
+        start: cursor,
+        end: args.rangeEnd,
+      },
+      args.enforceWorkingWindow ?? true,
+    );
+    if (!slot) {
+      return null;
+    }
+    placements.push({ start: slot.start, end: slot.end, prime: true });
+    registerInterval(intervals, slot);
+    cursor = alignToSlotIncrement(slot.end);
+  }
+
+  return { records: placements, intervals };
+}
+
+function findSlotWithinRange(
+  intervals: { start: Date; end: Date }[],
+  durationMinutes: number,
+  offsetMinutes: number,
+  options: { start: Date; end: Date },
+  enforceWorkingWindow = true,
+): PreferredSlot | null {
+  const durationMs = durationMinutes * 60000;
+  let candidateStart = alignToSlotIncrement(options.start);
+  const limit = options.end.getTime();
+  if (candidateStart.getTime() + durationMs > limit) return null;
+
+  while (candidateStart.getTime() + durationMs <= limit) {
+    const candidateEnd = new Date(candidateStart.getTime() + durationMs);
+    if (
+      (!enforceWorkingWindow || !isBeforeDayStart(candidateStart, offsetMinutes)) &&
+      (!enforceWorkingWindow || !isAfterDayEnd(candidateEnd, offsetMinutes)) &&
+      isSlotFree(candidateStart, candidateEnd, intervals)
+    ) {
+      return { start: candidateStart, end: candidateEnd };
+    }
+
+    candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
+    if (candidateStart.getTime() >= limit) break;
+    if (enforceWorkingWindow && isAfterDayEnd(candidateStart, offsetMinutes)) {
+      const nextDay = startOfDayOffset(addDays(candidateStart, 1), offsetMinutes);
+      candidateStart = alignToSlotIncrement(
+        new Date(Math.max(nextDay.getTime(), options.start.getTime())),
+      );
+    }
+  }
+
+  return null;
+}
+
+function findLatePlacementSlot(args: {
+  busyIntervals: { start: Date; end: Date }[];
+  durationMinutes: number;
+  offsetMinutes: number;
+  referenceNow: Date;
+  startFrom: Date;
+  enforceWorkingWindow?: boolean;
+}) {
+  const startFrom = new Date(Math.max(args.startFrom.getTime(), args.referenceNow.getTime()));
+  return findNextAvailableSlot(args.busyIntervals, args.durationMinutes, args.offsetMinutes, {
+    startFrom,
+    referenceNow: args.referenceNow,
+    enforceWorkingWindow: args.enforceWorkingWindow,
+  });
+}
+
+function alignToSlotIncrement(date: Date) {
+  const incrementMs = SLOT_INCREMENT_MINUTES * 60000;
+  const remainder = date.getTime() % incrementMs;
+  if (remainder === 0) {
+    return new Date(date.getTime());
+  }
+  return new Date(date.getTime() + (incrementMs - remainder));
+}
+
+function roundUpToIncrement(value: number, increment: number) {
+  if (increment <= 0) return value;
+  return Math.ceil(value / increment) * increment;
+}
+
+function buildChunksForSlot(
+  capture: CaptureEntryRow,
+  slot: PreferredSlot,
+  options: { late?: boolean; overlapped?: boolean; prime?: boolean } = {},
+): ChunkRecord[] {
+  const slotMinutes = Math.max(
+    SLOT_INCREMENT_MINUTES,
+    Math.max(1, Math.round((slot.end.getTime() - slot.start.getTime()) / 60000)),
+  );
+  const durations = generateChunkDurations({
+    totalMinutes: slotMinutes,
+    minChunkMinutes: capture.min_chunk_minutes ?? DEFAULT_MIN_CHUNK_MINUTES,
+    maxSplits: capture.max_splits ?? null,
+    allowSplitting: capture.duration_flexibility === "split_allowed",
+  });
+
+  if (durations.length === 0) {
+    return [
+      {
+        start: new Date(slot.start),
+        end: new Date(slot.end),
+        prime: options.prime ?? true,
+        late: options.late ?? false,
+        overlapped: options.overlapped ?? false,
+      },
+    ];
+  }
+
+  const records: ChunkRecord[] = [];
+  let cursor = new Date(slot.start);
+  for (let i = 0; i < durations.length; i++) {
+    const minutes = durations[i];
+    let chunkEnd = addMinutes(cursor, minutes);
+    if (chunkEnd.getTime() > slot.end.getTime() || i === durations.length - 1) {
+      chunkEnd = new Date(slot.end);
+    }
+    if (chunkEnd.getTime() <= cursor.getTime()) break;
+    records.push({
+      start: new Date(cursor),
+      end: chunkEnd,
+      prime: options.prime ?? true,
+      late: options.late ?? false,
+      overlapped: options.overlapped ?? false,
+    });
+    cursor = new Date(chunkEnd);
+    if (cursor.getTime() >= slot.end.getTime()) break;
+  }
+
+  if (records.length === 0) {
+    records.push({
+      start: new Date(slot.start),
+      end: new Date(slot.end),
+      prime: options.prime ?? true,
+      late: options.late ?? false,
+      overlapped: options.overlapped ?? false,
+    });
+  } else {
+    const last = records[records.length - 1];
+    if (last.end.getTime() !== slot.end.getTime()) {
+      last.end = new Date(slot.end);
+    }
+  }
+
+  return records;
+}
+
+function serializeChunks(records: ChunkRecord[]): SerializedChunk[] {
+  return records.map((record) => ({
+    start: record.start.toISOString(),
+    end: record.end.toISOString(),
+    late: Boolean(record.late),
+    overlapped: Boolean(record.overlapped),
+    prime: record.prime !== false,
+  }));
+}
+
+function summarizeWindowCapacity(grid: OccupancyGrid, rangeStart: Date, rangeEnd: Date) {
+  const start = rangeStart.getTime();
+  const end = rangeEnd.getTime();
+  let freeMinutes = 0;
+  let diaguruMinutes = 0;
+  let externalMinutes = 0;
+  for (const slot of grid.slots) {
+    if (slot.end.getTime() <= start) continue;
+    if (slot.start.getTime() >= end) break;
+    const overlapStart = Math.max(slot.start.getTime(), start);
+    const overlapEnd = Math.min(slot.end.getTime(), end);
+    if (overlapEnd <= overlapStart) continue;
+    const minutes = (overlapEnd - overlapStart) / 60000;
+    if (slot.status === "free") freeMinutes += minutes;
+    else if (slot.status === "diaguru") diaguruMinutes += minutes;
+    else externalMinutes += minutes;
+  }
+  return {
+    freeMinutes,
+    diaguruMinutes,
+    externalMinutes,
+  };
+}
+
+function buildDeadlineFailurePayload(args: {
+  capture: CaptureEntryRow;
+  durationMinutes: number;
+  deadline: Date;
+  windowStart: Date;
+  windowEnd: Date;
+  windowSummary: { freeMinutes: number; diaguruMinutes: number; externalMinutes: number } | null;
+  lateCandidate?: PreferredSlot | null;
+  reason: "slot_exceeds_deadline" | "no_slot";
+}) {
+  const summary = args.windowSummary ?? {
+    freeMinutes: 0,
+    diaguruMinutes: 0,
+    externalMinutes: 0,
+  };
+  const suggestions = [
+    "shorten_duration",
+    "relax_deadline",
+    "allow_splitting",
+    "enable_overlap",
+    "free_lower_priority_time",
+  ];
+  return {
+    error:
+      args.reason === "slot_exceeds_deadline"
+        ? "Found slot exceeds deadline/window."
+        : "No legal arrangement before the deadline/window.",
+    reason: args.reason,
+    capture_id: args.capture.id,
+    deadline: args.deadline.toISOString(),
+    window_start: args.windowStart.toISOString(),
+    window_end: args.windowEnd.toISOString(),
+    needed_minutes: args.durationMinutes,
+    available_free_minutes: Math.max(0, Math.floor(summary.freeMinutes)),
+    diaguru_minutes: Math.max(0, Math.floor(summary.diaguruMinutes)),
+    external_minutes: Math.max(0, Math.floor(summary.externalMinutes)),
+    late_candidate: args.lateCandidate
+      ? {
+        start: args.lateCandidate.start.toISOString(),
+        end: args.lateCandidate.end.toISOString(),
+      }
+      : null,
+    suggestions,
+  };
+}
+
+async function scheduleLatePlacementResponse(args: {
+  capture: CaptureEntryRow;
+  slot: PreferredSlot;
+  admin: SupabaseClient<Database, "public">;
+  google: GoogleCalendarActions;
+  planId: string;
+  capturePriority: number;
+  busyIntervals: { start: Date; end: Date }[];
+  recordPlanAction: (action: Omit<PlanActionRecord, "planId">) => Promise<void>;
+  finalizePlan: () => Promise<ReturnType<typeof buildPlanSummary> | null>;
+  schedulingNote: string;
+  responseMessage: string;
+}) {
+  const actionId = crypto.randomUUID();
+  const prevSnapshot = snapshotFromRow(args.capture);
+  const createdEvent = await args.google.createEvent({
+    capture: args.capture,
+    slot: args.slot,
+    planId: args.planId,
+    actionId,
+    priorityScore: args.capturePriority,
+  });
+  registerInterval(args.busyIntervals, args.slot);
+
+  const { data, error } = await args.admin
+    .from("capture_entries")
+    .update({
+      status: "scheduled",
+      planned_start: args.slot.start.toISOString(),
+      planned_end: args.slot.end.toISOString(),
+      scheduled_for: args.slot.start.toISOString(),
+      calendar_event_id: createdEvent.id,
+      calendar_event_etag: createdEvent.etag,
+      plan_id: args.planId,
+      freeze_until: null,
+      scheduling_notes: args.schedulingNote,
+    })
+    .eq("id", args.capture.id)
+    .select("*")
+    .single();
+
+  if (error || !data) {
+    throw new ScheduleError("Failed to persist late placement.", 500, error);
+  }
+
+  const chunkRecords = buildChunksForSlot(data as CaptureEntryRow, args.slot, { late: true });
+  await replaceCaptureChunks(args.admin, data as CaptureEntryRow, chunkRecords);
+  const serializedChunks = serializeChunks(chunkRecords);
+
+  await args.recordPlanAction({
+    actionId,
+    captureId: args.capture.id,
+    captureContent: args.capture.content,
+    actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+    prev: prevSnapshot,
+    next: snapshotFromRow(data as CaptureEntryRow),
+  });
+
+  const planSummary = await args.finalizePlan();
+  return json({
+    message: args.responseMessage,
+    capture: data,
+    planSummary,
+    chunks: serializedChunks,
+  });
+}
+
+async function tryScheduleWithOverlap(args: {
+  capture: CaptureEntryRow;
+  slot: PreferredSlot;
+  conflicts: ConflictSummary[];
+  admin: SupabaseClient<Database, "public">;
+  google: GoogleCalendarActions;
+  planId: string;
+  capturePriority: number;
+  busyIntervals: { start: Date; end: Date }[];
+  referenceNow: Date;
+  recordPlanAction: (action: Omit<PlanActionRecord, "planId">) => Promise<void>;
+  finalizePlan: () => Promise<ReturnType<typeof buildPlanSummary> | null>;
+  overlapUsage: Map<string, number>;
+  enforceWorkingWindow: boolean;
+}): Promise<Response | null> {
+  if (!schedulerConfig.overlap.enabled) return null;
+  if (args.conflicts.length === 0) return null;
+
+  if (!canCaptureOverlap(args.capture)) return null;
+
+  const conflictMap = await loadConflictCaptures(args.admin, args.conflicts);
+  if (conflictMap.size === 0) return null;
+
+  const overlapConfig = schedulerConfig.overlap;
+  if (args.conflicts.length + 1 > overlapConfig.maxConcurrency) return null;
+
+  const conflictingCaptures: CaptureEntryRow[] = [];
+  for (const conflict of args.conflicts) {
+    if (!conflict.captureId) return null;
+    const capture = conflictMap.get(conflict.captureId);
+    if (!capture || !canCaptureOverlap(capture)) {
+      return null;
+    }
+    conflictingCaptures.push(capture);
+  }
+
+  const slotMinutes = Math.max(
+    SLOT_INCREMENT_MINUTES,
+    Math.round((args.slot.end.getTime() - args.slot.start.getTime()) / 60000),
+  );
+  const targetEstimate = sanitizedEstimatedMinutes(args.capture);
+  const maxOverlapForTarget = Math.max(
+    SLOT_INCREMENT_MINUTES,
+    Math.floor(targetEstimate * overlapConfig.perTaskOverlapFraction),
+  );
+  if (slotMinutes > maxOverlapForTarget) return null;
+
+  const dayKey = args.slot.start.toISOString().slice(0, 10);
+  const usedMinutes = args.overlapUsage.get(dayKey) ?? 0;
+  if (usedMinutes + slotMinutes > overlapConfig.dailyBudgetMinutes) return null;
+
+  const conflictPriorities = conflictingCaptures.map((capture) =>
+    priorityForCapture(capture, args.referenceNow),
+  );
+  const highestConflictPriority =
+    conflictPriorities.length > 0 ? Math.max(...conflictPriorities) : 0;
+  const isPrime = args.capturePriority >= highestConflictPriority;
+
+  const targetMinutes = Math.max(1, sanitizedEstimatedMinutes(args.capture));
+  const overlapBenefit = (args.capturePriority / targetMinutes) * slotMinutes;
+  const overlapCost = overlapConfig.softCostPerMinute * slotMinutes;
+  const overlapNet = overlapBenefit - overlapCost;
+  if (overlapNet <= 0) {
+    logSchedulerEvent("overlap.rejected", {
+      captureId: args.capture.id,
+      overlapMinutes: slotMinutes,
+      reason: "soft_cost_exceeds_benefit",
+      overlapBenefit: Number(overlapBenefit.toFixed(3)),
+      overlapCost: Number(overlapCost.toFixed(3)),
+    });
+    return null;
+  }
+
+  const actionId = crypto.randomUUID();
+  const prevSnapshot = snapshotFromRow(args.capture);
+  const createdEvent = await args.google.createEvent({
+    capture: args.capture,
+    slot: args.slot,
+    planId: args.planId,
+    actionId,
+    priorityScore: args.capturePriority,
+  });
+  registerInterval(args.busyIntervals, args.slot);
+
+  const { data, error } = await args.admin
+    .from("capture_entries")
+    .update({
+      status: "scheduled",
+      planned_start: args.slot.start.toISOString(),
+      planned_end: args.slot.end.toISOString(),
+      scheduled_for: args.slot.start.toISOString(),
+      calendar_event_id: createdEvent.id,
+      calendar_event_etag: createdEvent.etag,
+      plan_id: args.planId,
+      freeze_until: null,
+      scheduling_notes: `Scheduled with overlap alongside ${conflictingCaptures.length} capture(s).`,
+    })
+    .eq("id", args.capture.id)
+    .select("*")
+    .single();
+
+  if (error || !data) {
+    throw new ScheduleError("Failed to persist overlap placement.", 500, error);
+  }
+
+  const chunkRecords = buildChunksForSlot(data as CaptureEntryRow, args.slot, {
+    overlapped: true,
+    prime: isPrime,
+  });
+  await replaceCaptureChunks(args.admin, data as CaptureEntryRow, chunkRecords);
+  const serializedChunks = serializeChunks(chunkRecords);
+
+  await args.recordPlanAction({
+    actionId,
+    captureId: args.capture.id,
+    captureContent: args.capture.content,
+    actionType: prevSnapshot.status === "scheduled" ? "rescheduled" : "scheduled",
+    prev: prevSnapshot,
+    next: snapshotFromRow(data as CaptureEntryRow),
+  });
+
+  args.overlapUsage.set(dayKey, usedMinutes + slotMinutes);
+
+  const planSummary = await args.finalizePlan();
+  logSchedulerEvent("overlap.commit", {
+    captureId: args.capture.id,
+    slot: { start: args.slot.start.toISOString(), end: args.slot.end.toISOString() },
+    conflicts: args.conflicts.map((conflict) => conflict.captureId),
+    overlapMinutes: slotMinutes,
+    dayKey,
+    prime: isPrime,
+    budget: {
+      used: usedMinutes + slotMinutes,
+      limit: overlapConfig.dailyBudgetMinutes,
+    },
+    overlapBenefit: Number(overlapBenefit.toFixed(3)),
+    overlapCost: Number(overlapCost.toFixed(3)),
+  });
+
+  logScheduleSummary("schedule.success", {
+    captureId: args.capture.id,
+    content: args.capture.content,
+    slot: { start: args.slot.start.toISOString(), end: args.slot.end.toISOString() },
+    overlap: {
+      conflicts: args.conflicts.map((c) => c.captureId),
+      minutes: slotMinutes,
+      budget: { used: usedMinutes + slotMinutes, limit: overlapConfig.dailyBudgetMinutes },
+      prime: isPrime,
+    },
+    planId: args.planId,
+  });
+
+  return json({
+    message: "Capture scheduled via overlap.",
+    capture: data,
+    planSummary,
+    chunks: serializedChunks,
+    overlap: {
+      minutes: slotMinutes,
+      conflicts: args.conflicts.map((conflict) => conflict.captureId),
+      day: dayKey,
+      prime: isPrime,
+      budget: {
+        used: usedMinutes + slotMinutes,
+        limit: overlapConfig.dailyBudgetMinutes,
+      },
+    },
+  });
+}
+
+async function pickGridPreemptionCandidate(args: {
+  candidates: GridWindowCandidate[];
+  events: CalendarEvent[];
+  capture: CaptureEntryRow;
+  capturePriority: number;
+  admin: SupabaseClient<Database, "public">;
+  referenceNow: Date;
+  offsetMinutes: number;
+}): Promise<GridPreemptionChoice | null> {
+  let best: GridPreemptionChoice | null = null;
+
+  for (const candidate of args.candidates) {
+    if (candidate.hasExternal) continue;
+    if (!isSlotWithinWorkingWindow(candidate.slot, args.offsetMinutes)) continue;
+
+    const conflicts = collectConflictingEvents(candidate.slot, args.events);
+    const externalConflicts = conflicts.filter((conflict) => !conflict.diaGuru);
+    if (externalConflicts.length > 0) continue;
+    const diaGuruConflicts = conflicts.filter((conflict) => conflict.diaGuru && conflict.captureId);
+    if (diaGuruConflicts.length === 0) continue;
+
+    const captureMap = await loadConflictCaptures(args.admin, diaGuruConflicts);
+    if (captureMap.size === 0) continue;
+    const movable: ConflictSummary[] = [];
+    let blocked = false;
+
+    for (const conflict of diaGuruConflicts) {
+      const blocker = conflict.captureId ? captureMap.get(conflict.captureId) : null;
+      if (!blocker) {
+        blocked = true;
+        break;
+      }
+      const frozen = hasActiveFreeze(blocker, args.referenceNow);
+      const stabilityLocked = withinStabilityWindow(blocker, args.referenceNow);
+      if (frozen || stabilityLocked) {
+        blocked = true;
+        break;
+      }
+      movable.push(conflict);
+    }
+    if (blocked || movable.length === 0) continue;
+
+    const outranksAll = movable.every((conflict) => {
+      const blocker = conflict.captureId ? captureMap.get(conflict.captureId) : null;
+      if (!blocker) return false;
+      const blockerPriority = priorityForCapture(blocker, args.referenceNow);
+      return args.capturePriority > blockerPriority;
+    });
+    if (!outranksAll) continue;
+
+    const displacements = buildPreemptionDisplacements(movable, captureMap);
+    if (displacements.length === 0) continue;
+    const slotMinutes = Math.max(
+      1,
+      (candidate.slot.end.getTime() - candidate.slot.start.getTime()) / 60000,
+    );
+    const evaluation = evaluatePreemptionNetGain({
+      target: args.capture,
+      displacements,
+      minutesClaimed: slotMinutes,
+      referenceNow: args.referenceNow,
+    });
+    if (!evaluation.allowed) continue;
+
+    if (!best || evaluation.net > best.evaluation.net) {
+      best = { slot: candidate.slot, conflicts: movable, captureMap, evaluation };
+    }
+  }
+
+  if (best) {
+    logSchedulerEvent("grid.preemption.candidate", {
+      captureId: args.capture.id,
+      slot: { start: best.slot.start.toISOString(), end: best.slot.end.toISOString() },
+      evaluation: {
+        net: Number(best.evaluation.net.toFixed(3)),
+        perMinuteGain: Number(best.evaluation.perMinuteGain.toFixed(4)),
+        overlapCost: Number(best.evaluation.overlapCost.toFixed(3)),
+        movedTasks: best.evaluation.movedTasks,
+        totalDisplacedMinutes: Number(best.evaluation.totalDisplacedMinutes.toFixed(2)),
+        thresholds: best.evaluation.thresholds,
+      },
+    });
+  }
+
+  return best;
+}
+
+function summarizeSlotStats(slots: OccupancySlot[]): OccupancyStats {
+  return slots.reduce(
+    (acc, slot) => {
+      acc[slot.status] += 1;
+      acc.total += 1;
+      return acc;
+    },
+    { free: 0, external: 0, diaguru: 0, total: 0 } as OccupancyStats,
+  );
+}
+
+function compressOccupancySegments(slots: OccupancySlot[]): OccupancySegment[] {
+  const segments: OccupancySegment[] = [];
+  for (const slot of slots) {
+    const prev = segments[segments.length - 1];
+    if (
+      prev &&
+      prev.status === slot.status &&
+      prev.eventId === slot.eventId &&
+      prev.captureId === slot.captureId
+    ) {
+      prev.end = slot.end.toISOString();
+      continue;
+    }
+    segments.push({
+      start: slot.start.toISOString(),
+      end: slot.end.toISOString(),
+      status: slot.status,
+      eventId: slot.eventId,
+      captureId: slot.captureId,
+    });
+  }
+  return segments;
+}
+
+function formatLocalDayLabel(dayStartUtc: Date, offsetMinutes: number) {
+  const local = toLocalDate(dayStartUtc, offsetMinutes);
+  const year = local.getUTCFullYear();
+  const month = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const date = String(local.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${date}`;
 }
 
 function parsePreferredSlot(
@@ -992,9 +2555,10 @@ function isSlotFeasible(
   slot: PreferredSlot,
   offsetMinutes: number,
   intervals: { start: Date; end: Date }[],
+  enforceWorkingWindow = true,
 ) {
-  if (isBeforeDayStart(slot.start, offsetMinutes)) return false;
-  if (isAfterDayEnd(slot.end, offsetMinutes)) return false;
+  if (enforceWorkingWindow && isBeforeDayStart(slot.start, offsetMinutes)) return false;
+  if (enforceWorkingWindow && isAfterDayEnd(slot.end, offsetMinutes)) return false;
   return isSlotFree(slot.start, slot.end, intervals);
 }
 
@@ -1003,16 +2567,17 @@ function findSlotBeforeDeadline(
   durationMinutes: number,
   offsetMinutes: number,
   options: { deadline: Date; referenceNow: Date },
+  enforceWorkingWindow = true,
 ): PreferredSlot | null {
   const durationMs = durationMinutes * 60000;
   const latestStart = new Date(options.deadline.getTime() - durationMs);
   if (latestStart.getTime() < options.referenceNow.getTime()) return null;
 
   let candidateStart = new Date(Math.max(options.referenceNow.getTime(), Date.now()));
-  if (isBeforeDayStart(candidateStart, offsetMinutes)) {
+  if (enforceWorkingWindow && isBeforeDayStart(candidateStart, offsetMinutes)) {
     candidateStart = startOfDayOffset(candidateStart, offsetMinutes);
   }
-  if (isAfterDayEnd(candidateStart, offsetMinutes)) {
+  if (enforceWorkingWindow && isAfterDayEnd(candidateStart, offsetMinutes)) {
     candidateStart = startOfDayOffset(addDays(candidateStart, 1), offsetMinutes);
   }
 
@@ -1021,15 +2586,15 @@ function findSlotBeforeDeadline(
     if (candidateEnd.getTime() > options.deadline.getTime()) break;
 
     if (
-      !isBeforeDayStart(candidateStart, offsetMinutes) &&
-      !isAfterDayEnd(candidateEnd, offsetMinutes) &&
+      (!enforceWorkingWindow || !isBeforeDayStart(candidateStart, offsetMinutes)) &&
+      (!enforceWorkingWindow || !isAfterDayEnd(candidateEnd, offsetMinutes)) &&
       isSlotFree(candidateStart, candidateEnd, intervals)
     ) {
       return { start: candidateStart, end: candidateEnd };
     }
 
     candidateStart = addMinutes(candidateStart, SLOT_INCREMENT_MINUTES);
-    if (isAfterDayEnd(candidateStart, offsetMinutes)) {
+    if (enforceWorkingWindow && isAfterDayEnd(candidateStart, offsetMinutes)) {
       candidateStart = startOfDayOffset(addDays(candidateStart, 1), offsetMinutes);
     }
   }
@@ -1042,6 +2607,7 @@ function findSlotWithinWindow(
   durationMinutes: number,
   offsetMinutes: number,
   options: { windowStart: Date; windowEnd: Date; referenceNow: Date },
+  enforceWorkingWindow = true,
 ): PreferredSlot | null {
   const durationMs = durationMinutes * 60000;
   let candidateStart = new Date(Math.max(options.windowStart.getTime(), options.referenceNow.getTime()));
@@ -1049,8 +2615,8 @@ function findSlotWithinWindow(
   while (candidateStart.getTime() + durationMs <= options.windowEnd.getTime()) {
     const candidateEnd = new Date(candidateStart.getTime() + durationMs);
     if (
-      !isBeforeDayStart(candidateStart, offsetMinutes) &&
-      !isAfterDayEnd(candidateEnd, offsetMinutes) &&
+      (!enforceWorkingWindow || !isBeforeDayStart(candidateStart, offsetMinutes)) &&
+      (!enforceWorkingWindow || !isAfterDayEnd(candidateEnd, offsetMinutes)) &&
       isSlotFree(candidateStart, candidateEnd, intervals)
     ) {
       return { start: candidateStart, end: candidateEnd };
@@ -1068,48 +2634,82 @@ function scheduleWithPlan(args: {
   offsetMinutes: number;
   referenceNow: Date;
   isSoftStart?: boolean;
+  enforceWorkingWindow?: boolean;
+  preferredTimeOfDay?: { start: number; end: number }[];
 }): PreferredSlot | null {
-  const { plan, durationMinutes, busyIntervals, offsetMinutes, referenceNow, isSoftStart } = args;
+  const {
+    plan,
+    durationMinutes,
+    busyIntervals,
+    offsetMinutes,
+    referenceNow,
+    isSoftStart,
+    enforceWorkingWindow = true,
+    preferredTimeOfDay,
+  } = args;
   if (plan.preferredSlot) {
     const adjusted = adjustSlotToReference(plan.preferredSlot, referenceNow);
-    if (isSlotFeasible(adjusted, offsetMinutes, busyIntervals)) {
+    if (isSlotFeasible(adjusted, offsetMinutes, busyIntervals, enforceWorkingWindow)) {
       return adjusted;
     }
   }
 
   if (plan.mode === "deadline" && plan.deadline) {
-    const deadlineSlot = findSlotBeforeDeadline(busyIntervals, durationMinutes, offsetMinutes, {
-      deadline: plan.deadline,
-      referenceNow,
-    });
+    const deadlineSlot = findSlotBeforeDeadline(
+      busyIntervals,
+      durationMinutes,
+      offsetMinutes,
+      {
+        deadline: plan.deadline,
+        referenceNow,
+      },
+      enforceWorkingWindow,
+    );
     if (deadlineSlot) return deadlineSlot;
   }
 
   if (plan.mode === "window" && plan.window) {
-    const windowSlot = findSlotWithinWindow(busyIntervals, durationMinutes, offsetMinutes, {
-      windowStart: plan.window.start,
-      windowEnd: plan.window.end,
-      referenceNow,
-    });
+    const windowSlot = findSlotWithinWindow(
+      busyIntervals,
+      durationMinutes,
+      offsetMinutes,
+      {
+        windowStart: plan.window.start,
+        windowEnd: plan.window.end,
+        referenceNow,
+      },
+      enforceWorkingWindow,
+    );
     if (windowSlot) return windowSlot;
   }
 
   if (plan.mode === "start" && plan.preferredSlot) {
     const toleranceMinutes = isSoftStart ? 120 : 60;
     const toleranceEnd = addMinutes(plan.preferredSlot.start, toleranceMinutes);
-    const windowSlot = findSlotWithinWindow(busyIntervals, durationMinutes, offsetMinutes, {
-      windowStart: plan.preferredSlot.start,
-      windowEnd: toleranceEnd,
-      referenceNow,
-    });
+    const windowSlot = findSlotWithinWindow(
+      busyIntervals,
+      durationMinutes,
+      offsetMinutes,
+      {
+        windowStart: plan.preferredSlot.start,
+        windowEnd: toleranceEnd,
+        referenceNow,
+      },
+      enforceWorkingWindow,
+    );
     if (windowSlot) return windowSlot;
   }
 
-  return findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, { referenceNow });
+  return findNextAvailableSlot(busyIntervals, durationMinutes, offsetMinutes, {
+    referenceNow,
+    enforceWorkingWindow,
+    preferredTimeOfDay,
+  });
 }
 
 export function priorityForCapture(capture: CaptureEntryRow, referenceNow: Date) {
-  return computePriorityScore(buildPriorityInput(capture), referenceNow);
+  const base = computePriorityScore(buildPriorityInput(capture), referenceNow);
+  return applyRoutinePriorityScore(base, detectRoutineKind(capture));
 }
 
 function buildPriorityInput(capture: CaptureEntryRow): PriorityInput {
@@ -1135,7 +2735,7 @@ function buildPriorityInput(capture: CaptureEntryRow): PriorityInput {
           }
         }
       }
-    } catch {}
+    } catch { }
   }
 
   return {
@@ -1221,6 +2821,113 @@ function selectMinimalPreemptionSet(args: {
   return null;
 }
 
+function buildPreemptionDisplacements(
+  conflicts: ConflictSummary[],
+  captureMap: Map<string, CaptureEntryRow>,
+): PreemptionDisplacement[] {
+  const displacements: PreemptionDisplacement[] = [];
+  for (const conflict of conflicts) {
+    if (!conflict.captureId) continue;
+    const capture = captureMap.get(conflict.captureId);
+    if (!capture) continue;
+    const minutes = estimateConflictMinutes(conflict, capture);
+    if (minutes <= 0) continue;
+    displacements.push({ capture, minutes });
+  }
+  return displacements;
+}
+
+function estimateConflictMinutes(conflict: ConflictSummary, capture: CaptureEntryRow) {
+  const start = firstValidDate([conflict.start, capture.planned_start, capture.scheduled_for]);
+  let end = firstValidDate([conflict.end, capture.planned_end]);
+  if (!end && start && typeof capture.estimated_minutes === "number") {
+    end = addMinutes(start, capture.estimated_minutes);
+  }
+  if (start && end) {
+    const diff = (end.getTime() - start.getTime()) / 60000;
+    if (diff > 0) return diff;
+  }
+  return Math.max(0, capture.estimated_minutes ?? 0);
+}
+
+function firstValidDate(candidates: (string | null | undefined)[]): Date | null {
+  for (const iso of candidates) {
+    if (!iso) continue;
+    const parsed = new Date(iso);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function detectRoutineKind(capture: CaptureEntryRow): RoutineKind | null {
+  const hint = capture.task_type_hint?.toLowerCase() ?? "";
+  const text = capture.content?.toLowerCase() ?? "";
+
+  if (hint.includes("routine.sleep") || /\bsleep|nap|bed ?time\b/.test(text)) {
+    return "sleep";
+  }
+  if (hint.includes("routine.meal") || /\b(breakfast|lunch|dinner|meal|eat)\b/.test(text)) {
+    return "meal";
+  }
+  return null;
+}
+
+function applyRoutinePrioritySnapshot(snapshot: ReturnType<typeof computePrioritySnapshot>, kind: RoutineKind, durationMinutes: number) {
+  const adjustedScore = applyRoutinePriorityScore(snapshot.score, kind);
+  return {
+    ...snapshot,
+    score: adjustedScore,
+    perMinute: adjustedScore / Math.max(durationMinutes, 1),
+  };
+}
+
+function applyRoutinePriorityScore(score: number, kind: RoutineKind | null) {
+  if (!kind) return score;
+  const rule = ROUTINE_PRIORITY_RULES[kind];
+  const scaled = score * rule.scaler;
+  return Math.min(scaled, rule.cap);
+}
+
+function shouldEnforceWorkingWindow(capture: CaptureEntryRow) {
+  return detectRoutineKind(capture) ? false : true;
+}
+
+function derivePreferredTimeOfDayBands(capture: CaptureEntryRow) {
+  const bands: { start: number; end: number }[] = [];
+  const pref = capture.time_pref_time_of_day;
+  const map: Record<string, { start: number; end: number }> = {
+    morning: { start: 8, end: 12 },
+    afternoon: { start: 12, end: 17 },
+    evening: { start: 17, end: 21 },
+    night: { start: 21, end: 26 },
+  };
+  if (pref && map[pref]) {
+    bands.push(map[pref]);
+  }
+  // Fallback to defaults based on task_type_hint
+  if (bands.length === 0 && capture.task_type_hint) {
+    const defaults = schedulerConfig.timeOfDayDefaults[capture.task_type_hint];
+    if (defaults && defaults.length > 0) {
+      bands.push(...defaults);
+    }
+  }
+  return bands.length > 0 ? bands : undefined;
+}
+
+function canCaptureOverlap(capture: CaptureEntryRow) {
+  if (capture.blocking) return false;
+  if (capture.start_flexibility === "hard") return false;
+  if (capture.cannot_overlap) return false;
+  if (readCannotOverlapFromNotes(capture)) return false;
+  return true;
+}
+
+function sanitizedEstimatedMinutes(capture: CaptureEntryRow) {
+  return Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
+}
+
 function readCannotOverlapFromNotes(capture: CaptureEntryRow): boolean {
   if (typeof (capture as any).cannot_overlap === 'boolean') return Boolean((capture as any).cannot_overlap);
   try {
@@ -1230,7 +2937,7 @@ function readCannotOverlapFromNotes(capture: CaptureEntryRow): boolean {
     if (parsed && typeof parsed === 'object' && parsed.flexibility && typeof parsed.flexibility === 'object') {
       return Boolean((parsed.flexibility as any).cannot_overlap);
     }
-  } catch {}
+  } catch { }
   return false;
 }
 
@@ -1266,17 +2973,17 @@ function collectConflictingEvents(slot: PreferredSlot, events: CalendarEvent[]):
     const bufferedStart = addMinutes(start, -BUFFER_MINUTES);
     const bufferedEnd = addMinutes(end, BUFFER_MINUTES);
     const overlaps = slot.start < bufferedEnd && slot.end > bufferedStart;
-  if (overlaps) {
-    conflicts.push({
-      id: event.id,
-      summary: event.summary,
-      start: start.toISOString(),
-      end: end.toISOString(),
-      diaGuru: event.extendedProperties?.private?.diaGuru === "true",
-      captureId: event.extendedProperties?.private?.capture_id,
-    });
+    if (overlaps) {
+      conflicts.push({
+        id: event.id,
+        summary: event.summary,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        diaGuru: event.extendedProperties?.private?.diaGuru === "true",
+        captureId: event.extendedProperties?.private?.capture_id,
+      });
+    }
   }
-}
   return conflicts;
 }
 
@@ -1431,6 +3138,7 @@ async function rescheduleCaptures(args: {
   for (const capture of queue) {
     const durationMinutes = Math.max(5, Math.min(capture.estimated_minutes ?? 30, 480));
     const plan = computeSchedulingPlan(capture, durationMinutes, offsetMinutes, referenceNow);
+    const enforceWorkingWindow = shouldEnforceWorkingWindow(capture);
     const slot = scheduleWithPlan({
       plan,
       durationMinutes,
@@ -1438,6 +3146,7 @@ async function rescheduleCaptures(args: {
       offsetMinutes,
       referenceNow,
       isSoftStart: capture.is_soft_start,
+      enforceWorkingWindow,
     });
 
     if (!slot) {
@@ -1480,9 +3189,8 @@ async function rescheduleCaptures(args: {
         .select("*")
         .single();
       if (!error && data) {
-        await replaceCaptureChunks(admin, data as CaptureEntryRow, [
-          { start: slot.start, end: slot.end },
-        ]);
+        const chunkRecords = buildChunksForSlot(data as CaptureEntryRow, slot);
+        await replaceCaptureChunks(admin, data as CaptureEntryRow, chunkRecords);
         registerInterval(busyIntervals, slot);
         await recordPlanAction({
           actionId,
@@ -1532,9 +3240,9 @@ async function buildConflictDecision(args: {
   const { capture, preferredSlot } = args;
   const suggestionPayload = args.suggestion
     ? {
-        start: args.suggestion.start.toISOString(),
-        end: args.suggestion.end.toISOString(),
-      }
+      start: args.suggestion.start.toISOString(),
+      end: args.suggestion.end.toISOString(),
+    }
     : null;
 
   const baseMessage = args.outsideWindow
@@ -1554,7 +3262,7 @@ async function buildConflictDecision(args: {
     try {
       const raw = (c as any).scheduling_notes as string | null | undefined;
       if (raw && typeof raw === 'string' && raw.trim().length > 0) facets = JSON.parse(raw);
-    } catch {}
+    } catch { }
     return {
       id: c.id,
       content: c.content,
